@@ -57,10 +57,17 @@ async def startup():
     await tg_app.initialize()
     await tg_app.start()
 
-    if PUBLIC_URL:
+    # Só tenta setar webhook se o PUBLIC_URL for válido
+    if PUBLIC_URL and PUBLIC_URL.startswith("https://"):
         url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
-        await tg_app.bot.set_webhook(url=url)
-        logger.info(f"Webhook setado: {url}")
+        try:
+            await tg_app.bot.set_webhook(url=url)
+            logger.info(f"Webhook setado: {url}")
+        except Exception:
+            logger.exception("Falha ao setar webhook (vou subir mesmo assim)")
+    else:
+        logger.warning("PUBLIC_URL inválido/ausente. Subindo sem webhook por enquanto.")
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -75,4 +82,5 @@ async def webhook(secret: str, request: Request):
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
+
     return {"ok": True}
