@@ -320,4 +320,6 @@ async def shutdown():
 tg_app.add_handler(CommandHandler("start", cmd_start))
 tg_app.add_handler(CommandHandler("reset", cmd_reset))
 tg_app.add_handler(CommandHandler("ajuda", cmd_ajuda))
-tg_app.add_handler(MessageHandler(filters.ALL, on_message))
+# Em vez de filters.ALL, use:
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+tg_app.add_handler(MessageHandler(filters.PHOTO, on_message))  # se você já trata foto no mesmo handler
