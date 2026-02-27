@@ -1,155 +1,285 @@
 import os
+import re
+import time
+import asyncio
 import logging
-from dotenv import load_dotenv
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 load_dotenv()
 
-# Telegram
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "vector")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # ex: https://professor-vector-bot.onrender.com
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "vector").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()  # ex: https://professor-vector-bot.onrender.com
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()  # pode trocar depois
 
-# Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
-
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("vector")
 
+# =========================
+# FASTAPI + TELEGRAM APP
+# =========================
 app = FastAPI()
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-# Cliente Gemini (SDK novo)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# =========================
+# STATE (Modo C)
+# =========================
+TRAVADO = "TRAVADO"
+PRESSA = "PRESSA"
+AUTONOMO = "AUTONOMO"
 
+PRESSA_WORDS = [
+    "resposta", "alternativa", "letra", "gabarito", "rápido", "rapido",
+    "logo", "agora", "pressa", "corrige", "qual é"
+]
+TRAVADO_WORDS = [
+    "não sei", "nao sei", "não entendi", "nao entendi", "travado",
+    "socorro", "me ajuda", "não consigo", "nao consigo", "nada", "perdido"
+]
+AUTONOMO_HINTS = [
+    "acho", "então", "entao", "porque", "pois", "logo", "daí", "dai", "=",
+    "+", "-", "x", "*", "/", ">", "<"
+]
+
+def normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 def telegram_safe(text: str) -> str:
-    # Telegram-friendly: sem LaTeX
-    if not text:
-        return "Não consegui gerar uma resposta agora."
-    text = text.replace("$", "")
+    # Sem LaTeX e sem estourar limite
+    text = (text or "").replace("$", "")
     if len(text) > 3500:
         text = text[:3500] + "…"
     return text
 
+@dataclass
+class UserState:
+    mode: str = AUTONOMO
+    score_travado: int = 0
+    score_pressa: int = 0
+    score_autonomo: int = 0
+    history: List[Tuple[str, str]] = field(default_factory=list)  # (role, text)
+    last_message_ids: Set[int] = field(default_factory=set)
 
-SYSTEM_STYLE = (
-    "Você é o Professor Vector, tutor de Matemática para o ENEM.\n"
-    "Responda SEM LaTeX. Escreva fórmulas em texto simples (ex: a + b = 10).\n"
-    "Explique passo a passo e, a cada etapa, faça uma pergunta curta para checar entendimento.\n"
-    "Se o aluno disser que não sabe por onde começar, ensine como iniciar.\n"
-)
+USER: Dict[int, UserState] = {}
 
+def get_user_state(user_id: int) -> UserState:
+    if user_id not in USER:
+        USER[user_id] = UserState()
+    return USER[user_id]
 
-async def ask_gemini_text(user_text: str) -> str:
-    if not gemini_client:
-        return "Configuração do Gemini não encontrada. (GEMINI_API_KEY vazia)"
-    prompt = f"{SYSTEM_STYLE}\nAluno: {user_text}\nProfessor Vector:"
-    resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
+def update_scores(st: UserState, text: str) -> None:
+    t = normalize_text(text)
+
+    # heurísticas simples e robustas
+    if any(w in t for w in TRAVADO_WORDS) or len(t) <= 2:
+        st.score_travado += 2
+
+    if any(w in t for w in PRESSA_WORDS):
+        st.score_pressa += 2
+
+    if any(w in t for w in AUTONOMO_HINTS) and len(t) >= 8:
+        st.score_autonomo += 2
+
+def decide_mode(st: UserState) -> str:
+    # prioridade: travado > pressa > autonomo (bem estável)
+    if st.score_travado >= 2:
+        return TRAVADO
+    if st.score_pressa >= 2:
+        return PRESSA
+    return AUTONOMO
+
+def clamp_history(st: UserState, max_items: int = 8) -> None:
+    if len(st.history) > max_items:
+        st.history = st.history[-max_items:]
+
+def system_prompt_for_mode(mode: str) -> str:
+    # MODO C (Inteligente) — texto enxuto e estilo certo
+    base = """
+Você é o Professor Vector, tutor de matemática ENEM do Prof. Wisner.
+Tom: humano, direto, motivador, sem enrolação.
+Sempre em português do Brasil.
+Nunca use LaTeX. Fórmulas sempre em texto simples (ex: "a + b = 17").
+Se precisar de símbolos, use Unicode comum (≤, ≥, √, etc) com parcimônia.
+Evite textos enormes: 1 a 3 bullets por mensagem no máximo.
+"""
+
+    modo = f"""
+Você deve adaptar automaticamente a resposta conforme o perfil do aluno, sem revelar o perfil.
+
+PERFIL ATUAL: {mode}
+
+Regras por perfil:
+
+TRAVADO:
+- Quebre em micro-passos.
+- Faça 1 pergunta curta por vez.
+- Confirme entendimento com "Fez sentido?" ou "Até aqui ok?"
+- Evite parágrafos longos.
+
+PRESSA:
+- Dê primeiro a resposta final (resultado ou alternativa) em 1 linha.
+- Depois explique em 3 passos bem curtos.
+- Pergunte se quer detalhar passo a passo.
+
+AUTONOMO:
+- Conduza com perguntas estratégicas.
+- Dê dicas e valide o raciocínio.
+- Só entregue tudo completo se o aluno pedir.
+
+Formato sugerido:
+- Comece com "Vamos nessa."
+- Se for PRESSA: "Resposta:" na primeira linha.
+- Termine com 1 pergunta (exceto quando for extremamente direto).
+"""
+    return (base + "\n" + modo).strip()
+
+# =========================
+# GEMINI CALL (sync SDK -> async)
+# =========================
+def gemini_generate(system: str, messages: List[Tuple[str, str]]) -> str:
+    """
+    messages: lista de (role, text) onde role é 'user' ou 'assistant'
+    """
+    if not GEMINI_API_KEY:
+        return "Estou sem conexão com o cérebro (API do Gemini). Me avise o administrador 🙂"
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=system
     )
-    return getattr(resp, "text", "") or "Não consegui gerar resposta."
 
+    # Converte histórico pro formato aceito
+    contents = []
+    for role, text in messages:
+        if role == "assistant":
+            contents.append({"role": "model", "parts": [text]})
+        else:
+            contents.append({"role": "user", "parts": [text]})
 
-async def ask_gemini_image(image_bytes: bytes, mime_type: str, user_text: str | None) -> str:
-    if not gemini_client:
-        return "Configuração do Gemini não encontrada. (GEMINI_API_KEY vazia)"
+    resp = model.generate_content(contents)
+    out = getattr(resp, "text", "") or ""
+    out = out.strip()
+    if not out:
+        out = "Tive um branco aqui 😅. Me manda sua dúvida em 1 frase ou a alternativa que você quer confirmar."
+    return out
 
-    # A doc oficial mostra envio de bytes via types.Part.from_bytes(...) no contents. :contentReference[oaicite:2]{index=2}
-    parts = [
-        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-    ]
+async def gemini_generate_async(system: str, messages: List[Tuple[str, str]]) -> str:
+    return await asyncio.to_thread(gemini_generate, system, messages)
 
-    text = (user_text or "").strip()
-    if not text:
-        text = "Resolva a questão do print/foto. Explique passo a passo e sem LaTeX."
-
-    prompt = f"{SYSTEM_STYLE}\nTarefa: {text}\nProfessor Vector:"
-    parts.append(prompt)
-
-    resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=parts,
-    )
-    return getattr(resp, "text", "") or "Não consegui interpretar a imagem."
-
-
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# COMMANDS
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
+    st = get_user_state(msg.from_user.id)
+    st.score_travado = st.score_pressa = st.score_autonomo = 0
+    st.mode = AUTONOMO
+    st.history.clear()
+    await msg.reply_text("Olá! Me diga seu nome e mande sua dúvida (pode ser texto).")
 
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    st = get_user_state(msg.from_user.id)
+    st.score_travado = st.score_pressa = st.score_autonomo = 0
+    st.mode = AUTONOMO
+    st.history.clear()
+    await msg.reply_text("Beleza! Zerei a conversa. Me diga sua dúvida do ENEM 🙂")
+
+async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    await msg.reply_text(
+        "Me mande sua dúvida de matemática por texto.\n"
+        "Dica: se estiver com pressa, diga 'quero só a alternativa'.\n"
+        "Comandos: /start /reset /ajuda"
+    )
+
+# =========================
+# MAIN HANDLER (texto)
+# =========================
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Texto
-        if msg.text and not msg.photo:
-            user_text = msg.text.strip()
-
-            # Comandos simples (opcional)
-            if user_text.lower() in ("/start", "start"):
-                await msg.reply_text("Olá! Me diga seu nome e mande sua dúvida (pode ser foto/print).")
-                return
-
-            answer = await ask_gemini_text(user_text)
-            await msg.reply_text(telegram_safe(answer))
+        msg = update.message
+        if not msg:
             return
 
-        # Foto/print
+        user_id = msg.from_user.id
+        st = get_user_state(user_id)
+
+        # dedupe simples (evita respostas repetidas)
+        if msg.message_id in st.last_message_ids:
+            return
+        st.last_message_ids.add(msg.message_id)
+        if len(st.last_message_ids) > 50:
+            # mantém conjunto pequeno
+            st.last_message_ids = set(list(st.last_message_ids)[-20:])
+
+        # por enquanto: só texto
         if msg.photo:
-            # pega a melhor resolução
-            photo = msg.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
-            image_bytes = await file.download_as_bytearray()
-
-            # Telegram manda geralmente JPEG
-            caption = (msg.caption or "").strip()
-            answer = await ask_gemini_image(bytes(image_bytes), "image/jpeg", caption)
-            await msg.reply_text(telegram_safe(answer))
+            await msg.reply_text("Por enquanto, me mande o enunciado em TEXTO 🙂\n(Depois vamos ativar leitura de print.)")
             return
 
-        await msg.reply_text("Me manda texto ou foto/print da questão 🙂")
+        if not msg.text:
+            await msg.reply_text("Me manda sua dúvida em texto 🙂")
+            return
+
+        user_text = msg.text.strip()
+
+        # Atualiza scores e decide modo
+        update_scores(st, user_text)
+        st.mode = decide_mode(st)
+
+        # Histórico curto
+        st.history.append(("user", user_text))
+        clamp_history(st, max_items=8)
+
+        system = system_prompt_for_mode(st.mode)
+        answer = await gemini_generate_async(system, st.history)
+
+        # salva resposta no histórico
+        st.history.append(("assistant", answer))
+        clamp_history(st, max_items=8)
+
+        await msg.reply_text(telegram_safe(answer))
 
     except Exception:
-        logger.exception("Falha geral no handler")
-        await msg.reply_text("Deu um erro aqui do meu lado. Tenta de novo agora?")
+        logger.exception("Falha no handler")
+        if update and update.message:
+            await update.message.reply_text("Deu um erro aqui do meu lado. Tenta de novo agora?")
 
-
-tg_app.add_handler(MessageHandler(filters.ALL, on_message))
-
-
-@app.on_event("startup")
-async def startup():
-    if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN vazio")
-        return
-
-    await tg_app.initialize()
-    await tg_app.start()
-
-    # Webhook: não pode derrubar o deploy se PUBLIC_URL estiver errado
-    if PUBLIC_URL and PUBLIC_URL.startswith("https://"):
-        try:
-            url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
-            await tg_app.bot.set_webhook(url=url)
-            logger.info(f"Webhook setado: {url}")
-        except Exception:
-            logger.exception("Falha ao setar webhook (continuando sem derrubar o app).")
-    else:
-        logger.warning("PUBLIC_URL vazio/ inválido. Webhook não foi setado.")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await tg_app.stop()
-    await tg_app.shutdown()
-
+# =========================
+# ROUTES / WEBHOOK
+# =========================
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "ts": int(time.time())}
 
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request):
@@ -161,7 +291,33 @@ async def webhook(secret: str, request: Request):
     await tg_app.process_update(update)
     return {"ok": True}
 
+@app.on_event("startup")
+async def startup():
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN vazio")
+        return
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY vazio (o bot sobe, mas não responde com IA)")
+
+    await tg_app.initialize()
+    await tg_app.start()
+
+    # Só seta webhook se PUBLIC_URL estiver correto (evita o erro do host)
+    if PUBLIC_URL.startswith("https://"):
+        url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
+        await tg_app.bot.set_webhook(url=url)
+        logger.info(f"Webhook setado: {url}")
+    else:
+        logger.warning("PUBLIC_URL não definido (ou sem https). Webhook NÃO foi setado automaticamente.")
+
+@app.on_event("shutdown")
+async def shutdown():
+    await tg_app.stop()
+    await tg_app.shutdown()
+
+# handlers
+tg_app.add_handler(CommandHandler("start", cmd_start))
+tg_app.add_handler(CommandHandler("reset", cmd_reset))
+tg_app.add_handler(CommandHandler("ajuda", cmd_ajuda))
+tg_app.add_handler(MessageHandler(filters.ALL, on_message))
