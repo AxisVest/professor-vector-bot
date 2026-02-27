@@ -1,7 +1,0 @@
-python-telegram-bot==21.6
-python-dotenv
-fastapi
-uvicorn[standard]
-google-generativeai
-requests
-pillow # Para processamento de imagem, se necessário, embora o Gemini Vision API lide com bytes diretamente
