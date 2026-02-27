@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+import time
 import httpx
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -38,11 +39,18 @@ logger = logging.getLogger("vector")
 genai.configure(api_key=GEMINI_API_KEY)
 active_gemini_model = GEMINI_MODEL
 
+SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
+
 async def initialize_gemini_model():
     global active_gemini_model
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
-        await asyncio.to_thread(model.generate_content, "Olá", safety_settings={})
+        await asyncio.to_thread(model.generate_content, "Olá", safety_settings=SAFETY_SETTINGS)
         active_gemini_model = GEMINI_MODEL
         logger.info(f"Gemini model OK: {active_gemini_model}")
     except Exception as e:
@@ -50,7 +58,7 @@ async def initialize_gemini_model():
         fallback = "gemini-1.5-flash"
         try:
             model = genai.GenerativeModel(fallback)
-            await asyncio.to_thread(model.generate_content, "Olá", safety_settings={})
+            await asyncio.to_thread(model.generate_content, "Olá", safety_settings=SAFETY_SETTINGS)
             active_gemini_model = fallback
             logger.info(f"Gemini fallback OK: {active_gemini_model}")
         except Exception as e2:
@@ -94,7 +102,7 @@ class UserState:
     score_travado: int = 0
     score_pressa: int = 0
     score_autonomo: int = 0
-    history: List[Dict[str, Union[str, List[Union[str, Dict]]]]] = field(default_factory=list)
+    history: List[Dict[str, Union[str, List[str]]]] = field(default_factory=list)
     user_name: Optional[str] = None
 
 USER_STATES: Dict[int, UserState] = {}
@@ -169,36 +177,60 @@ def system_instruction_for_gemini(mode: str, user_name: Optional[str]) -> str:
     name_greeting = f"Sempre chame o aluno de {user_name}." if user_name else ""
     return PROFESSOR_VECTOR_SYSTEM_PROMPT.format(name_greeting=name_greeting, mode=mode).strip()
 
-async def gemini_generate_async(system_instruction: str, chat_history: list, user_message_parts: list) -> str:
+async def gemini_generate_with_retry(system_instruction: str, chat_history: list, user_message_parts: list, max_retries: int = 3) -> str:
+    """Call Gemini API with automatic retry on rate limit errors."""
     model = genai.GenerativeModel(
         model_name=active_gemini_model,
         system_instruction=system_instruction
     )
-    try:
-        clean_history = []
-        for entry in chat_history:
-            clean_entry = {'role': entry['role'], 'parts': []}
-            for part in entry.get('parts', []):
-                if isinstance(part, str):
-                    clean_entry['parts'].append(part)
-            if clean_entry['parts']:
-                clean_history.append(clean_entry)
 
-        chat = model.start_chat(history=clean_history)
-        response = await asyncio.to_thread(
-            chat.send_message,
-            user_message_parts,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            },
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        return "Desculpe, tive um problema para gerar a resposta. Tente novamente mais tarde."
+    # Clean history: only keep text parts (remove binary image data)
+    clean_history = []
+    for entry in chat_history:
+        clean_entry = {'role': entry['role'], 'parts': []}
+        for part in entry.get('parts', []):
+            if isinstance(part, str):
+                clean_entry['parts'].append(part)
+        if clean_entry['parts']:
+            clean_history.append(clean_entry)
+
+    for attempt in range(max_retries):
+        try:
+            chat = model.start_chat(history=clean_history)
+            response = await asyncio.to_thread(
+                chat.send_message,
+                user_message_parts,
+                safety_settings=SAFETY_SETTINGS,
+            )
+            return response.text
+        except Exception as e:
+            error_str = str(e).lower()
+            logger.error(f"Gemini API error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+
+            # Check if it's a rate limit error (429) or resource exhausted
+            is_rate_limit = any(keyword in error_str for keyword in [
+                "429", "rate", "quota", "resource_exhausted", "resourceexhausted",
+                "too many requests", "limit"
+            ])
+
+            if is_rate_limit and attempt < max_retries - 1:
+                # Wait with exponential backoff: 5s, 15s, 30s
+                wait_time = (attempt + 1) * 5 + (attempt * 5)
+                logger.info(f"Rate limit hit. Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                continue
+            elif attempt < max_retries - 1:
+                # For other errors, short retry
+                await asyncio.sleep(2)
+                continue
+            else:
+                # All retries exhausted
+                if is_rate_limit:
+                    return "Estou com muitas solicitações agora. Espera uns 30 segundos e manda de novo que te respondo."
+                else:
+                    return "Desculpe, tive um problema para gerar a resposta. Tente novamente em instantes."
+
+    return "Desculpe, tive um problema para gerar a resposta. Tente novamente em instantes."
 
 # =========================
 # Telegram Handlers
@@ -214,8 +246,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_state.user_name = None
 
     await update.message.reply_text(
-        "Olá! Eu sou o Professor Vector, seu tutor de Matemática para o ENEM. "
-        "Para começarmos, qual é o seu nome completo?"
+        "Olá! Antes de começarmos, preciso do seu nome completo para personalizar nossa conversa. Pode me dizer?"
     )
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -230,8 +261,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if old_name:
         await update.message.reply_text(
-            f"Certo, {old_name}! Reiniciei nossa conversa. "
-            "Qual a sua dúvida de Matemática para o ENEM hoje?"
+            f"Certo, {old_name}.\n\nO que temos para hoje? Qual questão ou tópico você quer explorar?"
         )
     else:
         await update.message.reply_text(
@@ -240,8 +270,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Eu sou o Professor Vector, seu tutor de Matemática para o ENEM.\n\n"
-        "Você pode me enviar dúvidas em texto ou fotos de questões.\n"
+        "Seu tutor de Matemática para o ENEM. Me diga seu nome e mande sua dúvida (pode ser foto/print).\n\n"
         "/start - Iniciar conversa\n"
         "/reset - Reiniciar conversa\n"
         "/ajuda - Ver esta mensagem"
@@ -257,15 +286,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Handle user name identification (first message after /start)
     if user_state.user_name is None:
         if user_text.strip():
-            # Extract first name from the full name
             user_state.user_name = user_text.strip().split()[0].capitalize()
             await msg.reply_text(
-                f"Certo, {user_state.user_name}! É um prazer te ajudar. "
-                "Agora, me diga, qual é a sua dúvida em Matemática para o ENEM?"
+                f"Certo, {user_state.user_name}.\n\n"
+                "O que temos para hoje? Qual questão ou tópico você quer explorar?"
             )
             return
         else:
-            await msg.reply_text("Por favor, me diga seu nome completo para começarmos.")
+            await msg.reply_text("Antes de começarmos, preciso do seu nome completo. Pode me dizer?")
             return
 
     # Handle photo messages
@@ -280,7 +308,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if user_text:
                 user_message_parts.append(user_text)
             else:
-                user_message_parts.append("O aluno enviou esta imagem de uma questão. Analise e ajude.")
+                user_message_parts.append("O aluno enviou esta imagem de uma questão. Analise e conduza a resolução seguindo o método Interpretação → Estrutura → Conta.")
         except Exception as e:
             logger.error(f"Error downloading photo: {e}")
             await msg.reply_text("Não consegui baixar a imagem. Tenta enviar de novo?")
@@ -289,7 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_message_parts.append(user_text)
 
     if not user_message_parts:
-        await msg.reply_text("Por favor, envie uma mensagem de texto ou uma imagem.")
+        await msg.reply_text("Manda uma mensagem de texto ou uma imagem da questão.")
         return
 
     # Send "typing" action so user knows bot is working
@@ -303,15 +331,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Prepare system instruction
     system_instruction = system_instruction_for_gemini(user_state.mode, user_state.user_name)
 
-    # Add user message to history
-    user_state.history.append({'role': 'user', 'parts': user_message_parts})
+    # For history, save only text description of images (not binary data)
+    history_parts = []
+    for part in user_message_parts:
+        if isinstance(part, str):
+            history_parts.append(part)
+        elif isinstance(part, dict) and 'mime_type' in part:
+            history_parts.append("[Imagem enviada pelo aluno]")
 
-    # Clamp history (keep last 16 entries = 8 pairs)
-    if len(user_state.history) > 16:
-        user_state.history = user_state.history[-16:]
+    # Add user message to history (text only)
+    user_state.history.append({'role': 'user', 'parts': history_parts})
 
-    # Call Gemini API
-    answer = await gemini_generate_async(system_instruction, user_state.history[:-1], user_message_parts)
+    # Clamp history (keep last 12 entries = 6 pairs)
+    if len(user_state.history) > 12:
+        user_state.history = user_state.history[-12:]
+
+    # Call Gemini API with retry
+    answer = await gemini_generate_with_retry(
+        system_instruction,
+        user_state.history[:-1],
+        user_message_parts
+    )
 
     # Save model response to history
     user_state.history.append({'role': 'model', 'parts': [answer]})
@@ -354,7 +394,11 @@ async def on_startup():
     if PUBLIC_URL and WEBHOOK_SECRET:
         webhook_url = f"{PUBLIC_URL}/telegram"
         try:
-            await tg_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
+            await tg_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True
+            )
             logger.info(f"Webhook set: {webhook_url}")
         except Exception as e:
             logger.error(f"Failed to set webhook: {e}")
@@ -391,12 +435,12 @@ async def process_update_safe(update: Update):
     try:
         await tg_app.process_update(update)
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
+        logger.error(f"Error processing update: {type(e).__name__}: {e}")
         # Try to send error message to user
         try:
             if update.message:
                 await update.message.reply_text(
-                    "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
+                    "Tive um problema técnico. Manda de novo que te respondo."
                 )
         except Exception:
             pass
