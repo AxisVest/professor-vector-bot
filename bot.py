@@ -1,12 +1,11 @@
-
 import os
 import re
 import asyncio
 import logging
+import httpx
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, Bot
 from telegram.ext import (
@@ -20,16 +19,14 @@ from telegram.ext import (
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-load_dotenv()
-
 # =========================
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "vector").strip()
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()  # ex: https://professor-vector-bot.onrender.com
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() # Prioriza 2.5, se não, 1.5
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
@@ -39,32 +36,29 @@ logger = logging.getLogger("vector")
 # Gemini Setup
 # =========================
 genai.configure(api_key=GEMINI_API_KEY)
-
-# This will store the actual model name being used after initialization
 active_gemini_model = GEMINI_MODEL
 
 async def initialize_gemini_model():
     global active_gemini_model
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
-        # Test model availability
-        await asyncio.to_thread(model.generate_content, "test", safety_settings={})
+        await asyncio.to_thread(model.generate_content, "Olá", safety_settings={})
         active_gemini_model = GEMINI_MODEL
-        logger.info(f"Using Gemini model: {active_gemini_model}")
+        logger.info(f"Gemini model OK: {active_gemini_model}")
     except Exception as e:
-        logger.warning(f"Model {GEMINI_MODEL} not available or failed test: {e}. Trying gemini-1.5-flash.")
-        GEMINI_MODEL_FALLBACK = "gemini-1.5-flash"
+        logger.warning(f"Model {GEMINI_MODEL} failed: {e}. Trying gemini-1.5-flash.")
+        fallback = "gemini-1.5-flash"
         try:
-            model = genai.GenerativeModel(GEMINI_MODEL_FALLBACK)
-            await asyncio.to_thread(model.generate_content, "test", safety_settings={})
-            active_gemini_model = GEMINI_MODEL_FALLBACK
-            logger.info(f"Using Gemini fallback model: {active_gemini_model}")
-        except Exception as e_fallback:
-            logger.error(f"Fallback model {GEMINI_MODEL_FALLBACK} also failed: {e_fallback}. Defaulting to {GEMINI_MODEL} which might fail.")
-            active_gemini_model = GEMINI_MODEL # Keep original, but it's likely to fail
+            model = genai.GenerativeModel(fallback)
+            await asyncio.to_thread(model.generate_content, "Olá", safety_settings={})
+            active_gemini_model = fallback
+            logger.info(f"Gemini fallback OK: {active_gemini_model}")
+        except Exception as e2:
+            logger.error(f"Fallback also failed: {e2}")
+            active_gemini_model = GEMINI_MODEL
 
 # =========================
-# STATE (Modo C) - Adaptado do prompt original
+# STATE
 # =========================
 TRAVADO = "TRAVADO"
 PRESSA = "PRESSA"
@@ -89,7 +83,6 @@ def normalize_text(s: str) -> str:
     return s
 
 def telegram_safe(text: str) -> str:
-    # Remove LaTeX markers and truncate if too long
     text = (text or "").replace("$", "")
     if len(text) > 3500:
         text = text[:3500] + "…"
@@ -101,7 +94,6 @@ class UserState:
     score_travado: int = 0
     score_pressa: int = 0
     score_autonomo: int = 0
-    # History for Gemini API: [{'role': 'user', 'parts': ['text']}]
     history: List[Dict[str, Union[str, List[Union[str, Dict]]]]] = field(default_factory=list)
     user_name: Optional[str] = None
 
@@ -114,25 +106,23 @@ def get_user_state(user_id: int) -> UserState:
 
 def update_scores(st: UserState, text: str) -> None:
     t = normalize_text(text)
-
     if any(w in t for w in TRAVADO_WORDS) or len(t) <= 2:
         st.score_travado += 2
-
     if any(w in t for w in PRESSA_WORDS):
         st.score_pressa += 2
-
     if any(w in t for w in AUTONOMO_HINTS) and len(t) >= 8:
         st.score_autonomo += 2
 
 def decide_mode(st: UserState) -> str:
-    # prioridade: travado > pressa > autonomo (bem estável)
     if st.score_travado >= 2:
         return TRAVADO
     if st.score_pressa >= 2:
         return PRESSA
     return AUTONOMO
 
-# System prompt completo do Professor Vector (incorporado diretamente)
+# =========================
+# System Prompt
+# =========================
 PROFESSOR_VECTOR_SYSTEM_PROMPT = """
 Você é o Professor Vector, professor de Matemática para Ensino Médio e Pré-Vestibular (16–20 anos), com foco total em ENEM. Atua exclusivamente como tutor estratégico, adaptativo e orientado à autonomia do aluno. Não é assistente genérico.
 
@@ -164,12 +154,12 @@ FORMATO DAS RESPOSTAS
 2 a 6 linhas. Linguagem natural. Visual fluido. Sem blocos longos. Sem estrutura robótica. Uma pergunta no máximo por resposta. Priorizar sempre: Segurança pedagógica. Condução ativa. Objetividade. Foco total em Matemática ENEM.
 
 FORMATO MATEMÁTICO
-NUNCA usar notação LaTeX (como $x$, \frac, \sqrt, etc). O ambiente é Telegram/WhatsApp e LaTeX não renderiza.
+NUNCA usar notação LaTeX (como $x$, \\frac, \\sqrt, etc). O ambiente é Telegram/WhatsApp e LaTeX não renderiza.
 Escrever fórmulas em texto simples e legível. Exemplos:
 - Em vez de $a + b + c = 17$ → escrever: a + b + c = 17
-- Em vez de $\frac{1}{2}$ → escrever: 1/2
+- Em vez de $\\frac{{1}}{{2}}$ → escrever: 1/2
 - Em vez de $x^2$ → escrever: x²
-- Em vez de $\sqrt{9}$ → escrever: √9
+- Em vez de $\\sqrt{{9}}$ → escrever: √9
 Usar símbolos Unicode quando possível: ², ³, √, π, ≠, ≥, ≤, ÷, ×.
 
 PERFIL ATUAL: {mode}
@@ -179,23 +169,19 @@ def system_instruction_for_gemini(mode: str, user_name: Optional[str]) -> str:
     name_greeting = f"Sempre chame o aluno de {user_name}." if user_name else ""
     return PROFESSOR_VECTOR_SYSTEM_PROMPT.format(name_greeting=name_greeting, mode=mode).strip()
 
-async def gemini_generate_async(system_instruction: str, chat_history: List[Dict[str, Union[str, List[Union[str, Dict]]]]], user_message_parts: List[Union[str, Dict]]) -> str:
-    # Pass system_instruction at model creation time (correct Gemini API usage)
+async def gemini_generate_async(system_instruction: str, chat_history: list, user_message_parts: list) -> str:
     model = genai.GenerativeModel(
         model_name=active_gemini_model,
         system_instruction=system_instruction
     )
-
     try:
-        # Filter history to only include text-based entries (remove image data from old messages)
         clean_history = []
         for entry in chat_history:
             clean_entry = {'role': entry['role'], 'parts': []}
             for part in entry.get('parts', []):
                 if isinstance(part, str):
                     clean_entry['parts'].append(part)
-                # Skip image parts from old messages to avoid token issues
-            if clean_entry['parts']:  # Only add if there are text parts
+            if clean_entry['parts']:
                 clean_history.append(clean_entry)
 
         chat = model.start_chat(history=clean_history)
@@ -225,67 +211,89 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_state.score_travado = 0
     user_state.score_pressa = 0
     user_state.score_autonomo = 0
-    user_state.user_name = update.effective_user.first_name # Set initial name
+    user_state.user_name = None
 
     await update.message.reply_text(
-        f"Olá, {user_state.user_name}! Eu sou o Professor Vector, seu tutor de Matemática focado no ENEM. "
-        "Para começarmos, qual o seu nome completo? Assim posso te chamar corretamente!"
+        "Olá! Eu sou o Professor Vector, seu tutor de Matemática para o ENEM. "
+        "Para começarmos, qual é o seu nome completo?"
     )
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_state = get_user_state(user_id)
+    old_name = user_state.user_name
     user_state.history.clear()
     user_state.mode = AUTONOMO
     user_state.score_travado = 0
     user_state.score_pressa = 0
     user_state.score_autonomo = 0
-    user_state.user_name = update.effective_user.first_name # Reset name to first name
 
-    await update.message.reply_text(
-        f"Certo, {user_state.user_name}! Reiniciei nossa conversa. "
-        "Qual a sua dúvida de Matemática para o ENEM hoje?"
-    )
+    if old_name:
+        await update.message.reply_text(
+            f"Certo, {old_name}! Reiniciei nossa conversa. "
+            "Qual a sua dúvida de Matemática para o ENEM hoje?"
+        )
+    else:
+        await update.message.reply_text(
+            "Conversa reiniciada! Qual é o seu nome completo?"
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Eu sou o Professor Vector, seu tutor de Matemática para o ENEM. "
-        "Você pode me enviar suas dúvidas em texto ou com fotos de questões. "
-        "Use /start para iniciar uma nova conversa ou /reset para reiniciar o histórico. "
-        "Estou aqui para te ajudar a pensar junto!"
+        "Eu sou o Professor Vector, seu tutor de Matemática para o ENEM.\n\n"
+        "Você pode me enviar dúvidas em texto ou fotos de questões.\n"
+        "/start - Iniciar conversa\n"
+        "/reset - Reiniciar conversa\n"
+        "/ajuda - Ver esta mensagem"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_state = get_user_state(user_id)
     msg = update.message
-    user_text = msg.text
+    user_text = msg.text or msg.caption or ""
     user_message_parts = []
 
-    # Handle user name identification
-    if not user_state.user_name and user_text and len(user_text.split()) > 1: 
-        user_state.user_name = user_text.strip().split()[0] 
-        await msg.reply_text(f"Entendido, {user_state.user_name}! Prazer em te ajudar. Qual a sua dúvida?")
-        return
+    # Handle user name identification (first message after /start)
+    if user_state.user_name is None:
+        if user_text.strip():
+            # Extract first name from the full name
+            user_state.user_name = user_text.strip().split()[0].capitalize()
+            await msg.reply_text(
+                f"Certo, {user_state.user_name}! É um prazer te ajudar. "
+                "Agora, me diga, qual é a sua dúvida em Matemática para o ENEM?"
+            )
+            return
+        else:
+            await msg.reply_text("Por favor, me diga seu nome completo para começarmos.")
+            return
 
     # Handle photo messages
     if msg.photo:
-        photo_file = await msg.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        user_message_parts.append({
-            'mime_type': 'image/jpeg',
-            'data': bytes(photo_bytes)
-        })
-        if msg.caption:
-            user_message_parts.append(msg.caption)
-        else:
-            user_message_parts.append("Análise da imagem:")
+        try:
+            photo_file = await msg.photo[-1].get_file()
+            photo_bytes = await photo_file.download_as_bytearray()
+            user_message_parts.append({
+                'mime_type': 'image/jpeg',
+                'data': bytes(photo_bytes)
+            })
+            if user_text:
+                user_message_parts.append(user_text)
+            else:
+                user_message_parts.append("O aluno enviou esta imagem de uma questão. Analise e ajude.")
+        except Exception as e:
+            logger.error(f"Error downloading photo: {e}")
+            await msg.reply_text("Não consegui baixar a imagem. Tenta enviar de novo?")
+            return
     elif user_text:
         user_message_parts.append(user_text)
 
     if not user_message_parts:
         await msg.reply_text("Por favor, envie uma mensagem de texto ou uma imagem.")
         return
+
+    # Send "typing" action so user knows bot is working
+    await msg.chat.send_action("typing")
 
     # Update scores and decide mode
     if user_text:
@@ -294,14 +302,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Prepare system instruction
     system_instruction = system_instruction_for_gemini(user_state.mode, user_state.user_name)
-    
-    # Add user message to history for internal state management
+
+    # Add user message to history
     user_state.history.append({'role': 'user', 'parts': user_message_parts})
-    
-    # Clamp history to avoid exceeding token limits
-    # Keep only the last 8 messages (user + model pairs) for the actual chat history sent to Gemini
-    # The system instruction is passed separately.
-    if len(user_state.history) > 16: # 8 user messages + 8 model messages
+
+    # Clamp history (keep last 16 entries = 8 pairs)
+    if len(user_state.history) > 16:
         user_state.history = user_state.history[-16:]
 
     # Call Gemini API
@@ -309,8 +315,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Save model response to history
     user_state.history.append({'role': 'model', 'parts': [answer]})
-    
-    # Send response to Telegram (without ParseMode.MARKDOWN_V2)
+
+    # Send response
     await msg.reply_text(telegram_safe(answer))
 
 # =========================
@@ -319,56 +325,99 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 app = FastAPI()
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-@app.on_event("startup")
-async def on_startup():
-    if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
-        raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN not set")
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY environment variable not set.")
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set")
-
-    await initialize_gemini_model()
-    await tg_app.initialize()
-    await tg_app.start()
-    
-    if PUBLIC_URL and BOT_TOKEN and WEBHOOK_SECRET:
-        webhook_url = f"{PUBLIC_URL}/telegram"
-        try:
-            await tg_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
-            logger.info(f"Webhook set to {webhook_url}")
-        except Exception as e:
-            logger.error(f"Failed to set webhook: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to set webhook: {e}")
-    else:
-        logger.warning("PUBLIC_URL, BOT_TOKEN or WEBHOOK_SECRET not fully set. Webhook will not be configured. "
-                        "For local development, consider running tg_app.run_polling() if not using webhooks.")
-
-@app.post("/telegram")
-async def telegram_webhook(request: Request):
-    # Verify the secret token
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret token")
-
-    update = Update.de_json(await request.json(), tg_app.bot)
-    await tg_app.process_update(update)
-    return {"status": "ok"}
-
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok", "model": active_gemini_model}
-
-# Add handlers to the application
+# Add handlers
 tg_app.add_handler(CommandHandler("start", start_command))
 tg_app.add_handler(CommandHandler("reset", reset_command))
 tg_app.add_handler(CommandHandler("help", help_command))
 tg_app.add_handler(CommandHandler("ajuda", help_command))
 tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
-# For local development without webhook (uncomment to use)
-# if __name__ == "__main__":
-#     async def run_local():
-#         await initialize_gemini_model()
-#         await tg_app.run_polling()
-#     asyncio.run(run_local())
+@app.on_event("startup")
+async def on_startup():
+    logger.info("Starting Professor Vector Bot...")
 
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set!")
+        return
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY not set!")
+        return
+
+    # Initialize Gemini (in background to not block startup)
+    asyncio.create_task(initialize_gemini_model())
+
+    # Initialize Telegram app
+    await tg_app.initialize()
+    await tg_app.start()
+
+    # Set webhook
+    if PUBLIC_URL and WEBHOOK_SECRET:
+        webhook_url = f"{PUBLIC_URL}/telegram"
+        try:
+            await tg_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
+            logger.info(f"Webhook set: {webhook_url}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook: {e}")
+
+    # Start keep-alive task to prevent Render free instance from sleeping
+    asyncio.create_task(keep_alive())
+    logger.info("Bot started successfully!")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("Shutting down bot...")
+    try:
+        await tg_app.stop()
+        await tg_app.shutdown()
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    # Verify secret token
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+
+    data = await request.json()
+    update = Update.de_json(data, tg_app.bot)
+
+    # Process update in background so we return 200 immediately
+    asyncio.create_task(process_update_safe(update))
+    return {"status": "ok"}
+
+async def process_update_safe(update: Update):
+    """Process Telegram update with error handling."""
+    try:
+        await tg_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        # Try to send error message to user
+        try:
+            if update.message:
+                await update.message.reply_text(
+                    "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
+                )
+        except Exception:
+            pass
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "model": active_gemini_model}
+
+@app.get("/")
+async def root():
+    return {"status": "Professor Vector Bot is running", "model": active_gemini_model}
+
+async def keep_alive():
+    """Ping the own healthz endpoint every 10 minutes to prevent Render free tier from sleeping."""
+    await asyncio.sleep(30)  # Wait for startup to complete
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                if PUBLIC_URL:
+                    await client.get(f"{PUBLIC_URL}/healthz", timeout=10)
+                    logger.debug("Keep-alive ping sent")
+        except Exception as e:
+            logger.debug(f"Keep-alive ping failed: {e}")
+        await asyncio.sleep(600)  # Every 10 minutes
