@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import hashlib
+import random
 import httpx
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple
@@ -21,6 +22,7 @@ from telegram.ext import (
 
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from groq import Groq
 
 # =========================
 # ENV
@@ -30,6 +32,8 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "vector").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
@@ -39,7 +43,6 @@ logger = logging.getLogger("vector")
 # Gemini Setup
 # =========================
 genai.configure(api_key=GEMINI_API_KEY)
-active_gemini_model = GEMINI_MODEL
 
 SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -49,27 +52,71 @@ SAFETY_SETTINGS = {
 }
 
 # =========================
+# Groq Setup
+# =========================
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# =========================
+# CIRCUIT BREAKER
+# =========================
+class CircuitBreaker:
+    """Simple circuit breaker: after N failures in a window, open the circuit for cooldown."""
+    def __init__(self, name: str, failure_threshold: int = 3, window_seconds: int = 120, cooldown_seconds: int = 180):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.window_seconds = window_seconds
+        self.cooldown_seconds = cooldown_seconds
+        self.failures: List[float] = []
+        self.opened_at: Optional[float] = None
+
+    def is_open(self) -> bool:
+        if self.opened_at:
+            if time.time() - self.opened_at > self.cooldown_seconds:
+                # Cooldown expired, half-open: allow one try
+                self.opened_at = None
+                self.failures.clear()
+                logger.info(f"CircuitBreaker [{self.name}]: half-open, allowing retry")
+                return False
+            return True
+        return False
+
+    def record_failure(self):
+        now = time.time()
+        self.failures = [t for t in self.failures if now - t < self.window_seconds]
+        self.failures.append(now)
+        if len(self.failures) >= self.failure_threshold:
+            self.opened_at = time.time()
+            logger.warning(f"CircuitBreaker [{self.name}]: OPENED (cooldown {self.cooldown_seconds}s)")
+
+    def record_success(self):
+        self.failures.clear()
+        self.opened_at = None
+
+# Circuit breakers per provider
+gemini_cb = CircuitBreaker("gemini", failure_threshold=3, window_seconds=120, cooldown_seconds=180)
+groq_cb = CircuitBreaker("groq", failure_threshold=3, window_seconds=120, cooldown_seconds=180)
+
+# =========================
 # CONCURRENCY & RATE LIMIT
 # =========================
-# Semaphore: max 1 concurrent Gemini call (prevents RPM burst)
 GEMINI_CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "1"))
 gemini_sem = asyncio.Semaphore(GEMINI_CONCURRENCY)
+groq_sem = asyncio.Semaphore(2)
 
-# Per-user rate limit: min seconds between messages
-USER_RATE_LIMIT_SECONDS = 5
+# Per-user rate limit
+USER_RATE_LIMIT_SECONDS = 4
 user_last_message_time: Dict[int, float] = {}
 
-# Global rate limit: max requests per minute
-GLOBAL_RPM_LIMIT = 12  # stay under Gemini's 15 RPM
-global_request_times: List[float] = []
+# Per-user sticky provider (keep same provider during conversation)
+user_sticky_provider: Dict[int, Tuple[str, float]] = {}
+STICKY_DURATION = 300  # 5 minutes
 
 # =========================
 # RESPONSE CACHE
 # =========================
-# Cache responses for 60 seconds to avoid duplicate calls
 CACHE_TTL = 60
 response_cache: OrderedDict[str, Tuple[str, float]] = OrderedDict()
-MAX_CACHE_SIZE = 50
+MAX_CACHE_SIZE = 100
 
 def cache_key(user_id: int, text: str) -> str:
     normalized = (text or "").strip().lower()
@@ -86,45 +133,8 @@ def get_cached_response(key: str) -> Optional[str]:
 
 def set_cached_response(key: str, response: str):
     response_cache[key] = (response, time.time())
-    # Evict old entries
     while len(response_cache) > MAX_CACHE_SIZE:
         response_cache.popitem(last=False)
-
-# =========================
-# GLOBAL RPM TRACKING
-# =========================
-def check_global_rpm() -> bool:
-    """Returns True if we're under the global RPM limit."""
-    now = time.time()
-    # Remove entries older than 60 seconds
-    global global_request_times
-    global_request_times = [t for t in global_request_times if now - t < 60]
-    return len(global_request_times) < GLOBAL_RPM_LIMIT
-
-def record_global_request():
-    global_request_times.append(time.time())
-
-# =========================
-# Gemini Init
-# =========================
-async def initialize_gemini_model():
-    global active_gemini_model
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        await asyncio.to_thread(model.generate_content, "Olá", safety_settings=SAFETY_SETTINGS)
-        active_gemini_model = GEMINI_MODEL
-        logger.info(f"Gemini model OK: {active_gemini_model}")
-    except Exception as e:
-        logger.warning(f"Model {GEMINI_MODEL} failed: {e}. Trying gemini-1.5-flash.")
-        fallback = "gemini-1.5-flash"
-        try:
-            model = genai.GenerativeModel(fallback)
-            await asyncio.to_thread(model.generate_content, "Olá", safety_settings=SAFETY_SETTINGS)
-            active_gemini_model = fallback
-            logger.info(f"Gemini fallback OK: {active_gemini_model}")
-        except Exception as e2:
-            logger.error(f"Fallback also failed: {e2}")
-            active_gemini_model = GEMINI_MODEL
 
 # =========================
 # STATE
@@ -189,45 +199,42 @@ def decide_mode(st: UserState) -> str:
         return PRESSA
     return AUTONOMO
 
-# Dynamic history size per mode
 def max_history_for_mode(mode: str) -> int:
     if mode == PRESSA:
-        return 4   # 2 pairs
+        return 4
     elif mode == TRAVADO:
-        return 8   # 4 pairs
+        return 6
     else:
-        return 10  # 5 pairs
+        return 10
 
 # =========================
-# FALLBACK TEMPLATES
+# FALLBACK TEMPLATES (Tier 3)
 # =========================
-# When Gemini is unavailable, use these templates
 FALLBACK_TEMPLATES = {
     AUTONOMO: [
-        "Boa tentativa! Vamos pensar juntos: releia o enunciado e me diz o que ele está pedindo exatamente.",
-        "Antes de calcular, me conta: quais dados o problema te dá? Vamos organizar.",
-        "Certo, vamos por partes. Primeiro: o que você já sabe sobre esse tipo de questão?",
+        "{name}, vamos pensar juntos. Relê o enunciado e me diz: o que exatamente ele está pedindo?",
+        "Antes de calcular, {name}, me conta: quais são os dados que o problema te dá?",
+        "{name}, vamos organizar. Quais informações o enunciado traz e o que ele quer que você encontre?",
+        "Certo, {name}. Primeiro passo: interpreta o enunciado. O que ele pede?",
     ],
     TRAVADO: [
-        "Sem estresse. Vamos simplificar: lê o enunciado de novo e me diz só o que ele está pedindo.",
-        "Calma, vamos devagar. Me conta com suas palavras o que a questão quer.",
-        "Tudo bem travar, faz parte. Vamos recomeçar: o que o enunciado diz?",
+        "Sem estresse, {name}. Vamos simplificar: lê o enunciado de novo e me diz só o que ele pede.",
+        "Calma, {name}. Me conta com suas palavras o que a questão quer.",
+        "Tudo bem travar, faz parte. Vamos recomeçar, {name}: o que o enunciado diz?",
+        "{name}, respira. Me manda o enunciado que eu te guio passo a passo.",
     ],
     PRESSA: [
-        "Entendi a pressa. Me manda a questão completa que vou direto ao ponto.",
-        "Ok, vamos ser objetivos. Qual é a questão exata?",
-        "Certo, vou ser direto. Me mostra a questão.",
+        "Entendi a pressa, {name}. Me manda o enunciado completo que vou direto ao ponto.",
+        "{name}, vou ser direto. Cola a questão completa aqui.",
+        "Ok, {name}. Manda a questão que resolvo contigo de forma objetiva.",
     ],
 }
-
-import random
 
 def get_fallback_response(mode: str, user_name: Optional[str]) -> str:
     templates = FALLBACK_TEMPLATES.get(mode, FALLBACK_TEMPLATES[AUTONOMO])
     response = random.choice(templates)
-    if user_name:
-        response = response.replace("Vamos", f"{user_name}, vamos", 1)
-    return response
+    name = user_name or "aluno"
+    return response.replace("{name}", name)
 
 # =========================
 # COMPACT System Prompt
@@ -241,6 +248,7 @@ REGRAS ESSENCIAIS:
 - Nunca resolver sem tentativa prévia do aluno. Conduzir por perguntas.
 - Validar partes corretas. Corrigir um ponto por vez.
 - Se o aluno pedir só a resposta final com insistência, fornecer objetivamente.
+- Frustração/insegurança: validar em 1 frase, retomar matemática.
 
 FORMATO MATEMÁTICO (OBRIGATÓRIO):
 - NUNCA usar LaTeX ($x$, \\frac, \\sqrt). Telegram não renderiza.
@@ -255,69 +263,151 @@ def system_instruction_for_gemini(mode: str, user_name: Optional[str]) -> str:
     return PROFESSOR_VECTOR_SYSTEM_PROMPT.format(name_greeting=name_greeting, mode=mode).strip()
 
 # =========================
-# Gemini API Call with Semaphore + Retry
+# PROVIDER: GEMINI (Tier 1)
 # =========================
-async def gemini_generate_with_retry(
+async def call_gemini(system_instruction: str, chat_history: list, user_message_parts: list) -> Optional[str]:
+    """Call Gemini API. Returns None on failure."""
+    if gemini_cb.is_open():
+        logger.info("Gemini circuit is open, skipping.")
+        return None
+
+    async with gemini_sem:
+        try:
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=system_instruction
+            )
+            # Clean history: only text
+            clean_history = []
+            for entry in chat_history:
+                clean_entry = {'role': entry['role'], 'parts': []}
+                for part in entry.get('parts', []):
+                    if isinstance(part, str):
+                        clean_entry['parts'].append(part)
+                if clean_entry['parts']:
+                    clean_history.append(clean_entry)
+
+            chat = model.start_chat(history=clean_history)
+            response = await asyncio.to_thread(
+                chat.send_message,
+                user_message_parts,
+                safety_settings=SAFETY_SETTINGS,
+            )
+            gemini_cb.record_success()
+            logger.info("Gemini responded OK")
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini error: {type(e).__name__}: {e}")
+            gemini_cb.record_failure()
+            return None
+
+# =========================
+# PROVIDER: GROQ (Tier 2)
+# =========================
+async def call_groq(system_instruction: str, chat_history: list, user_text: str) -> Optional[str]:
+    """Call Groq API (text only, no image support). Returns None on failure."""
+    if not groq_client:
+        logger.info("Groq not configured, skipping.")
+        return None
+
+    if groq_cb.is_open():
+        logger.info("Groq circuit is open, skipping.")
+        return None
+
+    async with groq_sem:
+        try:
+            # Build messages for Groq (OpenAI-compatible format)
+            messages = [{"role": "system", "content": system_instruction}]
+
+            for entry in chat_history:
+                role = "assistant" if entry['role'] == 'model' else "user"
+                text_parts = [p for p in entry.get('parts', []) if isinstance(p, str)]
+                if text_parts:
+                    messages.append({"role": role, "content": " ".join(text_parts)})
+
+            messages.append({"role": "user", "content": user_text})
+
+            response = await asyncio.to_thread(
+                groq_client.chat.completions.create,
+                model=GROQ_MODEL,
+                messages=messages,
+                max_tokens=500,
+                temperature=0.7,
+            )
+            answer = response.choices[0].message.content
+            groq_cb.record_success()
+            logger.info("Groq responded OK")
+            return answer
+        except Exception as e:
+            logger.error(f"Groq error: {type(e).__name__}: {e}")
+            groq_cb.record_failure()
+            return None
+
+# =========================
+# PROVIDER ROUTER
+# =========================
+def get_sticky_provider(user_id: int) -> Optional[str]:
+    """Get sticky provider for user if still valid."""
+    if user_id in user_sticky_provider:
+        provider, ts = user_sticky_provider[user_id]
+        if time.time() - ts < STICKY_DURATION:
+            return provider
+        else:
+            del user_sticky_provider[user_id]
+    return None
+
+def set_sticky_provider(user_id: int, provider: str):
+    user_sticky_provider[user_id] = (provider, time.time())
+
+async def route_and_generate(
+    user_id: int,
     system_instruction: str,
     chat_history: list,
     user_message_parts: list,
-    max_retries: int = 3
+    user_text: str,
+    has_image: bool,
+    mode: str,
+    user_name: Optional[str]
 ) -> str:
-    """Call Gemini API with semaphore, global RPM check, and retry."""
+    """
+    Route request through providers:
+    Tier 1: Gemini (supports images)
+    Tier 2: Groq (text only)
+    Tier 3: Fallback templates
+    """
+    # Determine provider order based on stickiness and circuit state
+    sticky = get_sticky_provider(user_id)
 
-    # Check global RPM before even trying
-    if not check_global_rpm():
-        logger.warning("Global RPM limit reached. Using fallback.")
-        return None  # Caller will use fallback
+    # If has image, must try Gemini first (Groq doesn't support images)
+    if has_image:
+        providers = ["gemini", "groq"]
+    elif sticky == "groq" and not groq_cb.is_open():
+        providers = ["groq", "gemini"]
+    else:
+        providers = ["gemini", "groq"]
 
-    # Acquire semaphore (limits concurrent calls)
-    async with gemini_sem:
-        model = genai.GenerativeModel(
-            model_name=active_gemini_model,
-            system_instruction=system_instruction
-        )
+    for provider in providers:
+        if provider == "gemini":
+            answer = await call_gemini(system_instruction, chat_history, user_message_parts)
+            if answer:
+                set_sticky_provider(user_id, "gemini")
+                return answer
 
-        # Clean history: only text parts
-        clean_history = []
-        for entry in chat_history:
-            clean_entry = {'role': entry['role'], 'parts': []}
-            for part in entry.get('parts', []):
-                if isinstance(part, str):
-                    clean_entry['parts'].append(part)
-            if clean_entry['parts']:
-                clean_history.append(clean_entry)
+        elif provider == "groq":
+            # For images, extract text description
+            if has_image:
+                groq_text = user_text if user_text else "[O aluno enviou uma imagem de questão. Peça que ele transcreva o enunciado.]"
+            else:
+                groq_text = user_text
 
-        for attempt in range(max_retries):
-            try:
-                record_global_request()
-                chat = model.start_chat(history=clean_history)
-                response = await asyncio.to_thread(
-                    chat.send_message,
-                    user_message_parts,
-                    safety_settings=SAFETY_SETTINGS,
-                )
-                return response.text
-            except Exception as e:
-                error_str = str(e).lower()
-                logger.error(f"Gemini error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+            answer = await call_groq(system_instruction, chat_history, groq_text)
+            if answer:
+                set_sticky_provider(user_id, "groq")
+                return answer
 
-                is_rate_limit = any(kw in error_str for kw in [
-                    "429", "rate", "quota", "resource_exhausted",
-                    "resourceexhausted", "too many requests", "limit"
-                ])
-
-                if is_rate_limit and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 10  # 10s, 20s
-                    logger.info(f"Rate limit. Waiting {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                    continue
-                elif attempt < max_retries - 1:
-                    await asyncio.sleep(3)
-                    continue
-                else:
-                    return None  # Caller will use fallback
-
-    return None
+    # Tier 3: Fallback templates
+    logger.warning(f"All providers failed for user {user_id}. Using fallback.")
+    return get_fallback_response(mode, user_name)
 
 # =========================
 # Telegram Handlers
@@ -331,6 +421,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_state.score_pressa = 0
     user_state.score_autonomo = 0
     user_state.user_name = None
+    # Clear sticky provider
+    user_sticky_provider.pop(user_id, None)
 
     await update.message.reply_text(
         "Olá! Antes de começarmos, preciso do seu nome completo para personalizar nossa conversa. Pode me dizer?"
@@ -345,6 +437,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_state.score_travado = 0
     user_state.score_pressa = 0
     user_state.score_autonomo = 0
+    user_sticky_provider.pop(user_id, None)
 
     if old_name:
         await update.message.reply_text(
@@ -374,7 +467,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     now = time.time()
     last_time = user_last_message_time.get(user_id, 0)
     if now - last_time < USER_RATE_LIMIT_SECONDS:
-        # Silently ignore rapid messages (don't even reply to avoid spam)
         logger.debug(f"Rate limited user {user_id}")
         return
     user_last_message_time[user_id] = now
@@ -426,7 +518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update_scores(user_state, user_text)
     user_state.mode = decide_mode(user_state)
 
-    # --- Check cache (only for text messages, not images) ---
+    # --- Check cache (text only, not images) ---
     c_key = None
     if not has_image and user_text:
         c_key = cache_key(user_id, user_text)
@@ -449,22 +541,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_state.history.append({'role': 'user', 'parts': history_parts})
 
-    # Dynamic history clamp based on mode
+    # Dynamic history clamp
     max_hist = max_history_for_mode(user_state.mode)
     if len(user_state.history) > max_hist:
         user_state.history = user_state.history[-max_hist:]
 
-    # Call Gemini API with semaphore + retry
-    answer = await gemini_generate_with_retry(
-        system_instruction,
-        user_state.history[:-1],
-        user_message_parts
+    # --- ROUTE through providers ---
+    answer = await route_and_generate(
+        user_id=user_id,
+        system_instruction=system_instruction,
+        chat_history=user_state.history[:-1],
+        user_message_parts=user_message_parts,
+        user_text=user_text or "[Imagem enviada]",
+        has_image=has_image,
+        mode=user_state.mode,
+        user_name=user_state.user_name
     )
-
-    # If Gemini failed or rate limited, use fallback template
-    if answer is None:
-        answer = get_fallback_response(user_state.mode, user_state.user_name)
-        logger.info(f"Using fallback response for user {user_id}")
 
     # Save to history
     user_state.history.append({'role': 'model', 'parts': [answer]})
@@ -482,7 +574,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 app = FastAPI()
 tg_app = Application.builder().token(BOT_TOKEN).build()
 
-# Add handlers
 tg_app.add_handler(CommandHandler("start", start_command))
 tg_app.add_handler(CommandHandler("reset", reset_command))
 tg_app.add_handler(CommandHandler("help", help_command))
@@ -491,7 +582,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Starting Professor Vector Bot...")
+    logger.info("Starting Professor Vector Bot (Multi-Provider)...")
 
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
@@ -500,8 +591,10 @@ async def on_startup():
         logger.error("GEMINI_API_KEY not set!")
         return
 
-    # Initialize Gemini (in background)
-    asyncio.create_task(initialize_gemini_model())
+    # Log provider status
+    logger.info(f"Tier 1: Gemini ({GEMINI_MODEL}) - {'OK' if GEMINI_API_KEY else 'NOT SET'}")
+    logger.info(f"Tier 2: Groq ({GROQ_MODEL}) - {'OK' if GROQ_API_KEY else 'NOT SET'}")
+    logger.info("Tier 3: Fallback templates - ALWAYS AVAILABLE")
 
     # Initialize Telegram app
     await tg_app.initialize()
@@ -520,7 +613,7 @@ async def on_startup():
         except Exception as e:
             logger.error(f"Failed to set webhook: {e}")
 
-    # Start keep-alive
+    # Keep-alive
     asyncio.create_task(keep_alive())
     logger.info("Bot started successfully!")
 
@@ -541,13 +634,10 @@ async def telegram_webhook(request: Request):
 
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-
-    # Process in background — return 200 immediately
     asyncio.create_task(process_update_safe(update))
     return {"status": "ok"}
 
 async def process_update_safe(update: Update):
-    """Process Telegram update with error handling."""
     try:
         await tg_app.process_update(update)
     except Exception as e:
@@ -562,14 +652,17 @@ async def process_update_safe(update: Update):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "model": active_gemini_model}
+    return {
+        "status": "ok",
+        "gemini": "open" if gemini_cb.is_open() else "ok",
+        "groq": "open" if groq_cb.is_open() else ("ok" if groq_client else "not_configured"),
+    }
 
 @app.get("/")
 async def root():
-    return {"status": "Professor Vector Bot is running", "model": active_gemini_model}
+    return {"status": "Professor Vector Bot is running (Multi-Provider)"}
 
 async def keep_alive():
-    """Ping own healthz every 10 min to prevent Render free tier sleep."""
     await asyncio.sleep(30)
     while True:
         try:
