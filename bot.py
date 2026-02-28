@@ -1,6 +1,7 @@
 """
-Professor Vector Bot — AIRouter Multi-Provider
-Providers: Gemini (Tier 1) | Groq (Tier 2) | Cohere (Tier 3) | HuggingFace (Tier 4) | Templates (Tier 5)
+Professor Vector Bot — AIRouter Multi-Provider v3
+Providers: Gemini (imagens + fallback texto) | Groq | Cohere | HuggingFace | Templates
+Melhorias v3: Gemini reservado p/ imagens, histórico por questão, prompt enriquecido
 """
 
 import os
@@ -87,10 +88,9 @@ class CircuitBreaker:
 
 
 # =========================
-# BUDGET MANAGER (RPM tracking per provider)
+# BUDGET MANAGER
 # =========================
 class BudgetManager:
-    """Track requests-per-minute and daily usage per provider."""
     def __init__(self, name: str, rpm_limit: int, daily_limit: int):
         self.name = name
         self.rpm_limit = rpm_limit
@@ -129,7 +129,6 @@ class BudgetManager:
 
     @property
     def health_score(self) -> float:
-        """0.0 = exhausted, 1.0 = fully available."""
         self._clean()
         rpm_ratio = self.rpm_available / max(self.rpm_limit, 1)
         daily_ratio = self.daily_available / max(self.daily_limit, 1)
@@ -146,7 +145,7 @@ class ProviderClient(ABC):
         self.circuit = circuit
         self.budget = budget
         self.semaphore = semaphore
-        self.avg_latency: float = 2.0  # seconds, rolling average
+        self.avg_latency: float = 2.0
 
     @property
     def available(self) -> bool:
@@ -154,7 +153,6 @@ class ProviderClient(ABC):
 
     @property
     def priority_score(self) -> float:
-        """Higher = better. Combines health, latency, circuit state."""
         if not self.available:
             return -1.0
         health = self.budget.health_score
@@ -170,9 +168,7 @@ class ProviderClient(ABC):
 
     async def generate(self, system_prompt: str, messages: List[Dict], image_parts: Optional[List] = None) -> Optional[str]:
         if not self.available:
-            logger.info(f"[{self.name}] not available (circuit={self.circuit.is_open}, budget={self.budget.can_call})")
             return None
-
         async with self.semaphore:
             start = time.time()
             try:
@@ -218,34 +214,25 @@ class GeminiProvider(ProviderClient):
 
     async def _call(self, system_prompt: str, messages: List[Dict], image_parts: Optional[List] = None) -> Optional[str]:
         model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=system_prompt)
-        # Build Gemini history
+        # Build history (all except last message)
         history = []
-        for m in messages:
+        for m in messages[:-1]:
             role = "model" if m["role"] == "assistant" else "user"
             history.append({"role": role, "parts": [m["content"]]})
 
         chat = model.start_chat(history=history)
 
-        # Build user message parts
+        # Build current message parts
         user_parts = []
         if image_parts:
             user_parts.extend(image_parts)
-        # Add text part (last message from user or default)
-        if messages and messages[-1]["role"] == "user":
-            # Already in history, send image with instruction
-            if image_parts:
-                user_parts.append("O aluno enviou esta imagem de uma questão. Analise e conduza a resolução seguindo Interpretação → Estrutura → Conta.")
+            last_text = messages[-1]["content"] if messages else ""
+            if last_text and not last_text.startswith("[Imagem"):
+                user_parts.append(last_text)
             else:
-                user_parts.append(messages[-1]["content"])
-            # Remove last from history since we send it as current message
-            if history and history[-1]["role"] == "user":
-                history.pop()
-                chat = model.start_chat(history=history)
-                if not image_parts:
-                    user_parts = [messages[-1]["content"]]
-
-        if not user_parts:
-            user_parts = ["Continue a conversa."]
+                user_parts.append("O aluno enviou esta imagem de uma questão. Analise e conduza a resolução seguindo Interpretação → Estrutura → Conta.")
+        else:
+            user_parts = [messages[-1]["content"] if messages else "Continue a conversa."]
 
         response = await asyncio.to_thread(
             chat.send_message, user_parts, safety_settings=self.safety
@@ -274,12 +261,11 @@ class GroqProvider(ProviderClient):
         api_messages = [{"role": "system", "content": system_prompt}]
         for m in messages:
             api_messages.append({"role": m["role"], "content": m["content"]})
-
         response = await asyncio.to_thread(
             client.chat.completions.create,
             model=GROQ_MODEL,
             messages=api_messages,
-            max_tokens=500,
+            max_tokens=600,
             temperature=0.7,
         )
         return response.choices[0].message.content if response.choices else None
@@ -301,15 +287,11 @@ class CohereProvider(ProviderClient):
     async def _call(self, system_prompt: str, messages: List[Dict], image_parts: Optional[List] = None) -> Optional[str]:
         if not COHERE_API_KEY:
             return None
-
-        # Build chat history for Cohere
         chat_history = []
         for m in messages[:-1] if messages else []:
             role = "CHATBOT" if m["role"] == "assistant" else "USER"
             chat_history.append({"role": role, "message": m["content"]})
-
         user_message = messages[-1]["content"] if messages else "Olá"
-
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 "https://api.cohere.com/v1/chat",
@@ -322,7 +304,7 @@ class CohereProvider(ProviderClient):
                     "preamble": system_prompt,
                     "message": user_message,
                     "chat_history": chat_history,
-                    "max_tokens": 500,
+                    "max_tokens": 600,
                     "temperature": 0.7,
                 },
             )
@@ -350,17 +332,13 @@ class HuggingFaceProvider(ProviderClient):
     async def _call(self, system_prompt: str, messages: List[Dict], image_parts: Optional[List] = None) -> Optional[str]:
         if not HF_API_KEY:
             return None
-
-        # Build prompt for HF Inference API (chat format)
         prompt_parts = [f"<s>[INST] {system_prompt}\n"]
         for m in messages:
             if m["role"] == "user":
                 prompt_parts.append(f"[INST] {m['content']} [/INST]")
             else:
                 prompt_parts.append(f"{m['content']}</s>")
-
         full_prompt = "\n".join(prompt_parts)
-
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
                 f"https://api-inference.huggingface.co/models/{HF_MODEL}",
@@ -368,7 +346,7 @@ class HuggingFaceProvider(ProviderClient):
                 json={
                     "inputs": full_prompt,
                     "parameters": {
-                        "max_new_tokens": 400,
+                        "max_new_tokens": 500,
                         "temperature": 0.7,
                         "return_full_text": False,
                     },
@@ -378,14 +356,10 @@ class HuggingFaceProvider(ProviderClient):
                 data = response.json()
                 if isinstance(data, list) and data:
                     text = data[0].get("generated_text", "")
-                    # Clean up common artifacts
                     text = text.strip()
                     if "[/INST]" in text:
                         text = text.split("[/INST]")[-1].strip()
                     return text if text else None
-                return None
-            elif response.status_code == 503:
-                logger.warning(f"[huggingface] Model loading (503)")
                 return None
             else:
                 logger.error(f"[huggingface] HTTP {response.status_code}: {response.text[:200]}")
@@ -393,33 +367,44 @@ class HuggingFaceProvider(ProviderClient):
 
 
 # =========================
-# AI ROUTER (Central Intelligence)
+# AI ROUTER v3
 # =========================
 class AIRouter:
     """
-    Central router that intelligently distributes requests across providers.
-    Decisions based on: availability, health score, latency, image support, stickiness.
+    Central router v3:
+    - Imagem = SEMPRE Gemini (reservado)
+    - Texto = Groq > Cohere > HuggingFace > Gemini (fallback)
+    - Se Gemini indisponível p/ imagem = pedir para digitar
     """
     def __init__(self):
-        self.providers: List[ProviderClient] = []
+        self.gemini: Optional[GeminiProvider] = None
+        self.text_providers: List[ProviderClient] = []
+        self.all_providers: List[ProviderClient] = []
         self.user_sticky: Dict[int, Tuple[str, float]] = {}
-        self.sticky_duration = 300  # 5 min
+        self.sticky_duration = 300
 
         # Initialize providers
         if GEMINI_API_KEY:
-            self.providers.append(GeminiProvider())
-            logger.info(f"AIRouter: Gemini ({GEMINI_MODEL}) registered")
+            self.gemini = GeminiProvider()
+            self.all_providers.append(self.gemini)
+            logger.info(f"AIRouter: Gemini ({GEMINI_MODEL}) registered [IMAGENS + FALLBACK TEXTO]")
         if GROQ_API_KEY:
-            self.providers.append(GroqProvider())
-            logger.info(f"AIRouter: Groq ({GROQ_MODEL}) registered")
+            p = GroqProvider()
+            self.text_providers.append(p)
+            self.all_providers.append(p)
+            logger.info(f"AIRouter: Groq ({GROQ_MODEL}) registered [TEXTO PRIMÁRIO]")
         if COHERE_API_KEY:
-            self.providers.append(CohereProvider())
-            logger.info(f"AIRouter: Cohere ({COHERE_MODEL}) registered")
+            p = CohereProvider()
+            self.text_providers.append(p)
+            self.all_providers.append(p)
+            logger.info(f"AIRouter: Cohere ({COHERE_MODEL}) registered [TEXTO]")
         if HF_API_KEY:
-            self.providers.append(HuggingFaceProvider())
-            logger.info(f"AIRouter: HuggingFace ({HF_MODEL}) registered")
+            p = HuggingFaceProvider()
+            self.text_providers.append(p)
+            self.all_providers.append(p)
+            logger.info(f"AIRouter: HuggingFace ({HF_MODEL}) registered [TEXTO]")
 
-        logger.info(f"AIRouter: {len(self.providers)} providers active + fallback templates")
+        logger.info(f"AIRouter v3: {len(self.all_providers)} providers + fallback templates")
 
     def _get_sticky(self, user_id: int) -> Optional[str]:
         if user_id in self.user_sticky:
@@ -435,28 +420,6 @@ class AIRouter:
     def _clear_sticky(self, user_id: int):
         self.user_sticky.pop(user_id, None)
 
-    def _rank_providers(self, needs_image: bool) -> List[ProviderClient]:
-        """Rank available providers by priority score, filtering by image support if needed."""
-        candidates = []
-        for p in self.providers:
-            if needs_image and not p.supports_image:
-                continue
-            if p.available:
-                candidates.append(p)
-
-        # Sort by priority score descending
-        candidates.sort(key=lambda p: p.priority_score, reverse=True)
-
-        # If needs_image but no image-capable provider available, add text-only providers
-        # (they'll ask the student to type the question)
-        if needs_image and not candidates:
-            for p in self.providers:
-                if p.available:
-                    candidates.append(p)
-            candidates.sort(key=lambda p: p.priority_score, reverse=True)
-
-        return candidates
-
     async def generate(
         self,
         user_id: int,
@@ -467,52 +430,64 @@ class AIRouter:
         mode: str = "AUTONOMO",
         user_name: Optional[str] = None,
     ) -> str:
-        """
-        Route request through providers intelligently.
-        Returns the response text (always returns something, even if fallback).
-        """
-        # 1. Check sticky provider first
-        sticky_name = self._get_sticky(user_id)
-        if sticky_name:
-            sticky_provider = next((p for p in self.providers if p.name == sticky_name), None)
-            if sticky_provider and sticky_provider.available:
-                if not has_image or sticky_provider.supports_image:
-                    result = await sticky_provider.generate(system_prompt, messages, image_parts if has_image else None)
-                    if result:
-                        return result
-                    # Sticky provider failed, clear and try others
-                    logger.info(f"Sticky provider [{sticky_name}] failed, trying others")
+        # === IMAGEM: SEMPRE GEMINI ===
+        if has_image:
+            if self.gemini and self.gemini.available:
+                result = await self.gemini.generate(system_prompt, messages, image_parts)
+                if result:
+                    self._set_sticky(user_id, "gemini")
+                    return result
+                logger.warning("Gemini falhou para imagem, tentando sem imagem")
 
-        # 2. Rank and try providers in order
-        ranked = self._rank_providers(needs_image=has_image)
-        logger.info(f"AIRouter ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
+            # Gemini indisponível para imagem — pedir para digitar
+            name = user_name or "aluno"
+            return (
+                f"{name}, não consegui processar a imagem agora. "
+                f"Pode digitar o enunciado da questão que eu te ajudo?"
+            )
+
+        # === TEXTO: Groq > Cohere > HF > Gemini (fallback) ===
+        # 1. Tentar sticky provider primeiro
+        sticky_name = self._get_sticky(user_id)
+        if sticky_name and sticky_name != "gemini":
+            sticky_p = next((p for p in self.text_providers if p.name == sticky_name), None)
+            if sticky_p and sticky_p.available:
+                result = await sticky_p.generate(system_prompt, messages, None)
+                if result:
+                    return result
+
+        # 2. Tentar provedores de texto por score
+        ranked = sorted(
+            [p for p in self.text_providers if p.available],
+            key=lambda p: p.priority_score,
+            reverse=True,
+        )
+        logger.info(f"AIRouter texto ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
 
         for provider in ranked:
-            if has_image and not provider.supports_image:
-                # For text-only providers with image, modify the message
-                text_messages = messages.copy()
-                if text_messages and "[Imagem enviada" in text_messages[-1].get("content", ""):
-                    text_messages[-1] = {
-                        "role": "user",
-                        "content": "O aluno enviou uma imagem que não consigo ver. Peça que ele transcreva o enunciado da questão."
-                    }
-                result = await provider.generate(system_prompt, text_messages, None)
-            else:
-                result = await provider.generate(system_prompt, messages, image_parts if has_image else None)
-
+            result = await provider.generate(system_prompt, messages, None)
             if result:
                 self._set_sticky(user_id, provider.name)
                 return result
 
-        # 3. All providers failed — Tier 5: Fallback templates
-        logger.warning(f"AIRouter: ALL providers failed for user {user_id}. Fallback.")
+        # 3. Fallback: tentar Gemini para texto (último recurso antes de templates)
+        if self.gemini and self.gemini.available:
+            logger.info("AIRouter: todos text providers falharam, tentando Gemini para texto")
+            result = await self.gemini.generate(system_prompt, messages, None)
+            if result:
+                self._set_sticky(user_id, "gemini")
+                return result
+
+        # 4. Templates (Tier 5)
+        logger.warning(f"AIRouter: TODOS providers falharam para user {user_id}. Fallback.")
         return get_fallback_response(mode, user_name)
 
     def get_status(self) -> Dict[str, Any]:
-        """Return status of all providers for healthz endpoint."""
         status = {}
-        for p in self.providers:
+        for p in self.all_providers:
+            role = "IMAGENS + FALLBACK" if p.name == "gemini" else "TEXTO"
             status[p.name] = {
+                "role": role,
                 "available": p.available,
                 "circuit": "open" if p.circuit.is_open else "closed",
                 "rpm_available": p.budget.rpm_available,
@@ -548,6 +523,14 @@ AUTONOMO_HINTS = [
     "=", "+", "-", "x", "*", "/", ">", "<"
 ]
 
+# Palavras que indicam que o aluno terminou a questão
+QUESTION_DONE_WORDS = [
+    "entendi", "entendido", "obrigado", "obrigada", "valeu", "vlw",
+    "próxima", "proxima", "outra questão", "outra questao", "nova questão",
+    "nova questao", "outro assunto", "mudando", "seguinte", "bora",
+    "beleza", "show", "top", "ok entendi", "perfeito", "massa"
+]
+
 USER_RATE_LIMIT_SECONDS = 4
 user_last_message_time: Dict[int, float] = {}
 
@@ -580,14 +563,18 @@ def telegram_safe(text: str) -> str:
         text = text[:3500] + "…"
     return text
 
+
 @dataclass
 class UserState:
     mode: str = AUTONOMO
     score_travado: int = 0
     score_pressa: int = 0
     score_autonomo: int = 0
-    history: List[Dict[str, str]] = field(default_factory=list)  # [{"role": "user"|"assistant", "content": "..."}]
+    history: List[Dict[str, str]] = field(default_factory=list)
     user_name: Optional[str] = None
+    # v3: Questão ativa — guardamos o enunciado original separado
+    active_question: Optional[str] = None
+    question_resolved: bool = True  # True = sem questão ativa, pode limpar
 
 USER_STATES: Dict[int, UserState] = {}
 
@@ -612,8 +599,41 @@ def decide_mode(st: UserState) -> str:
         return PRESSA
     return AUTONOMO
 
-def max_history(mode: str) -> int:
-    return {PRESSA: 4, TRAVADO: 6}.get(mode, 10)
+def is_question_done(text: str) -> bool:
+    """Detecta se o aluno sinalizou que terminou/entendeu a questão."""
+    t = normalize_text(text)
+    return any(w in t for w in QUESTION_DONE_WORDS)
+
+def is_new_question(text: str) -> bool:
+    """Detecta se o aluno está enviando uma nova questão (enunciado longo ou com marcadores)."""
+    t = (text or "").strip()
+    # Enunciado longo (>80 chars) ou contém marcadores de questão
+    has_question_markers = any(m in t.lower() for m in [
+        "questão", "questao", "enem", "(a)", "(b)", "(c)", "(d)", "(e)",
+        "a)", "b)", "c)", "d)", "e)", "alternativa", "qual é o valor",
+        "qual o valor", "determine", "calcule", "encontre"
+    ])
+    is_long = len(t) > 80
+    return has_question_markers or is_long
+
+def is_referring_old_question(text: str) -> bool:
+    """Detecta se o aluno está se referindo a uma questão anterior."""
+    t = normalize_text(text)
+    return any(w in t for w in [
+        "aquela questão", "aquela questao", "questão anterior", "questao anterior",
+        "a de antes", "a outra", "lembra da questão", "lembra da questao",
+        "volta na questão", "volta na questao", "a questão que", "a questao que"
+    ])
+
+def max_history_for_mode(mode: str, question_active: bool) -> int:
+    """
+    Se há questão ativa, manter histórico COMPLETO (até 30 pares).
+    Se não há questão ativa, usar limites normais.
+    """
+    if question_active:
+        return 60  # 30 pares user+assistant
+    return {PRESSA: 6, TRAVADO: 10}.get(mode, 14)
+
 
 # =========================
 # FALLBACK TEMPLATES (Tier 5)
@@ -643,31 +663,63 @@ def get_fallback_response(mode: str, user_name: Optional[str]) -> str:
     name = user_name or "aluno"
     return random.choice(templates).replace("{name}", name)
 
+
 # =========================
-# SYSTEM PROMPT (compact)
+# SYSTEM PROMPT (enriquecido com estilo Wisner)
 # =========================
 SYSTEM_PROMPT_TEMPLATE = """Você é o Professor Vector, tutor de Matemática para ENEM (16-20 anos). Tutor estratégico, não assistente genérico.
 
-REGRAS ESSENCIAIS:
-- Comunicação curta e direta (estilo WhatsApp). {name_greeting}
+IDENTIDADE E POSTURA:
+- Comunicação curta, fluida e direta (estilo WhatsApp). {name_greeting}
 - Ordem obrigatória: Interpretação → Estrutura → Conta.
 - Respostas de 2 a 6 linhas. Máximo 1 pergunta por resposta.
 - Nunca resolver sem tentativa prévia do aluno. Conduzir por perguntas.
 - Validar partes corretas. Corrigir um ponto por vez.
 - Se o aluno pedir só a resposta final com insistência, fornecer objetivamente.
 - Frustração/insegurança: validar em 1 frase, retomar matemática.
+- Variar aberturas e evitar repetição excessiva.
+
+RIGOR MATEMÁTICO (PRIORIDADE MÁXIMA):
+- SEMPRE releia o enunciado COMPLETO antes de dar qualquer resposta ou conclusão.
+- Verifique se a questão pede valor TOTAL ou valor ADICIONAL/NOVO.
+- Verifique se há condições iniciais (ex: "já havia 1 placa") que alteram a resposta.
+- Nunca usar atalhos matematicamente inválidos.
+- Preservar coerência algébrica em todos os passos.
+- Antecipar erros comuns quando necessário.
+- Se perceber que errou, corrija imediatamente e explique o erro.
+
+ESTILO DE RESOLUÇÃO (baseado no Professor Wisner):
+- Sempre traduzir o cenário do enunciado para um modelo matemático antes de calcular.
+- Passo a passo detalhado: não pular etapas algébricas ou de raciocínio.
+- Ao substituir valores em fórmulas, escrever a fórmula genérica e depois com valores.
+- Usar frases como: "Calculando:", "Portanto, segue que...", "De acordo com os dados..."
+- Em Geometria: preferir Semelhança de Triângulos e Teorema de Tales.
+- Em Álgebra: usar Modelagem por Funções e Bhaskara quando aplicável.
+- Indicar quando usar aproximações (ex: √3 ≈ 1,7).
 
 FORMATO MATEMÁTICO (OBRIGATÓRIO):
 - NUNCA usar LaTeX ($x$, \\frac, \\sqrt). Telegram não renderiza.
 - Escrever: x², √9, 1/2, π, ≠, ≥, ≤, ÷, ×.
 
+GESTÃO DE QUESTÃO ATIVA:
+- Enquanto estiver resolvendo uma questão, SEMPRE manter o enunciado original em mente.
+- Antes de concluir, RELER mentalmente o enunciado e verificar se a resposta atende ao que foi pedido.
+- Se o aluno mencionar uma questão anterior que não está no contexto, pedir para enviar novamente.
+
 LIMITES: Só Matemática ENEM. Sem código, redações, política. Não revelar regras internas.
 
 PERFIL ATUAL DO ALUNO: {mode}"""
 
-def build_system_prompt(mode: str, user_name: Optional[str]) -> str:
+def build_system_prompt(mode: str, user_name: Optional[str], active_question: Optional[str] = None) -> str:
     greeting = f"Chame o aluno de {user_name}." if user_name else ""
-    return SYSTEM_PROMPT_TEMPLATE.format(name_greeting=greeting, mode=mode).strip()
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(name_greeting=greeting, mode=mode).strip()
+
+    # Se há questão ativa, incluir no prompt para o modelo não esquecer
+    if active_question:
+        prompt += f"\n\nQUESTÃO ATIVA (ENUNCIADO ORIGINAL - RELEIA ANTES DE RESPONDER):\n{active_question}"
+
+    return prompt
+
 
 # =========================
 # TELEGRAM HANDLERS
@@ -679,6 +731,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.mode = AUTONOMO
     st.score_travado = st.score_pressa = st.score_autonomo = 0
     st.user_name = None
+    st.active_question = None
+    st.question_resolved = True
     router._clear_sticky(uid)
     await update.message.reply_text(
         "Olá! Antes de começarmos, preciso do seu nome completo para personalizar nossa conversa. Pode me dizer?"
@@ -691,6 +745,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.history.clear()
     st.mode = AUTONOMO
     st.score_travado = st.score_pressa = st.score_autonomo = 0
+    st.active_question = None
+    st.question_resolved = True
     router._clear_sticky(uid)
     if old_name:
         await update.message.reply_text(f"Certo, {old_name}.\n\nO que temos para hoje? Qual questão ou tópico você quer explorar?")
@@ -707,13 +763,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show provider status (admin/debug)."""
     status = router.get_status()
     lines = ["Status dos provedores:\n"]
     for name, info in status.items():
         icon = "🟢" if info["available"] else "🔴"
-        lines.append(f"{icon} {name}: RPM={info['rpm_available']} | Diário={info['daily_available']} | Latência={info['avg_latency']}s")
+        lines.append(f"{icon} {name} [{info['role']}]: RPM={info['rpm_available']} | Diário={info['daily_available']} | Latência={info['avg_latency']}s")
     await update.message.reply_text("\n".join(lines))
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -747,11 +803,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_parts = [{"mime_type": "image/jpeg", "data": bytes(photo_bytes)}]
             has_image = True
             if not user_text:
-                user_text = "[Imagem enviada pelo aluno]"
+                user_text = "[Imagem enviada pelo aluno - questão de matemática]"
         except Exception as e:
             logger.error(f"Photo download error: {e}")
-            await msg.reply_text("Não consegui baixar a imagem. Tenta enviar de novo?")
+            await msg.reply_text(f"{st.user_name}, não consegui baixar a imagem. Tenta enviar de novo?")
             return
+
+    # Handle document (PDF)
+    if msg.document and not has_image:
+        await msg.reply_text(
+            f"{st.user_name}, não consigo ler PDFs diretamente. "
+            f"Pode tirar um print/foto da questão ou digitar o enunciado?"
+        )
+        return
 
     if not user_text and not has_image:
         await msg.reply_text("Manda uma mensagem de texto ou uma imagem da questão.")
@@ -759,26 +823,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.chat.send_action("typing")
 
+    # === GESTÃO DE QUESTÃO ATIVA ===
+
+    # Detectar se aluno está se referindo a questão antiga
+    if is_referring_old_question(user_text) and st.question_resolved:
+        await msg.reply_text(
+            f"{st.user_name}, não tenho mais essa questão na memória. "
+            f"Pode enviar ela de novo (texto ou foto) que eu te ajudo?"
+        )
+        return
+
+    # Detectar se o aluno terminou a questão atual
+    if is_question_done(user_text) and not st.question_resolved:
+        st.question_resolved = True
+        st.active_question = None
+        # Limpar histórico antigo, manter só últimas 4 mensagens
+        if len(st.history) > 4:
+            st.history = st.history[-4:]
+        st.score_travado = max(0, st.score_travado - 2)
+        st.score_pressa = max(0, st.score_pressa - 2)
+
+    # Detectar nova questão
+    if is_new_question(user_text) or has_image:
+        st.active_question = user_text if not has_image else f"[Questão enviada por imagem] {user_text}"
+        st.question_resolved = False
+        # Limpar histórico de questão anterior ao iniciar nova
+        if len(st.history) > 4:
+            st.history = st.history[-4:]
+        st.score_travado = 0
+        st.score_pressa = 0
+        st.score_autonomo = 0
+
     # Update mode
     if user_text and not user_text.startswith("["):
         update_scores(st, user_text)
     st.mode = decide_mode(st)
 
-    # Cache check
+    # Cache check (só para texto sem questão ativa)
     c_key = None
-    if not has_image:
+    if not has_image and st.question_resolved:
         c_key = cache_key(uid, user_text)
         cached = get_cached(c_key)
         if cached:
             await msg.reply_text(telegram_safe(cached))
             return
 
-    # Build system prompt
-    sys_prompt = build_system_prompt(st.mode, st.user_name)
+    # Build system prompt (com questão ativa se houver)
+    sys_prompt = build_system_prompt(st.mode, st.user_name, st.active_question)
 
     # Add to history
     st.history.append({"role": "user", "content": user_text})
-    mx = max_history(st.mode)
+
+    # Limitar histórico baseado no modo e se há questão ativa
+    mx = max_history_for_mode(st.mode, not st.question_resolved)
     if len(st.history) > mx:
         st.history = st.history[-mx:]
 
@@ -796,11 +893,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Save to history
     st.history.append({"role": "assistant", "content": answer})
 
-    # Cache
-    if c_key:
+    # Cache (só se não tem questão ativa)
+    if c_key and st.question_resolved:
         set_cached(c_key, answer)
 
     await msg.reply_text(telegram_safe(answer))
+
 
 # =========================
 # FASTAPI APP
@@ -813,11 +911,11 @@ tg_app.add_handler(CommandHandler("reset", cmd_reset))
 tg_app.add_handler(CommandHandler("help", cmd_help))
 tg_app.add_handler(CommandHandler("ajuda", cmd_help))
 tg_app.add_handler(CommandHandler("status", cmd_status))
-tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
+tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_message))
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info("=== Professor Vector Bot — AIRouter Multi-Provider ===")
+    logger.info("=== Professor Vector Bot — AIRouter v3 Multi-Provider ===")
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
         return
@@ -871,7 +969,7 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return {"status": "Professor Vector Bot — AIRouter Multi-Provider"}
+    return {"status": "Professor Vector Bot — AIRouter v3"}
 
 async def keep_alive():
     await asyncio.sleep(30)
