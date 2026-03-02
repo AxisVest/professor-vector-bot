@@ -1,9 +1,13 @@
 """
-Professor Vector Bot — v5 Gemini-First + Knowledge Base
+Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking
 Providers: Gemini (PRIMÁRIO para TUDO) | Groq | Cohere | HuggingFace (FALLBACK)
-v5: Gemini como provedor principal, knowledge base com seleção inteligente,
-    detecção de frustração, resolução direta quando aluno trava,
-    memória robusta para imagens, rigor matemático máximo.
+v6: Correções críticas sobre v5:
+    1. Anti-loop de repetição (SequenceMatcher, >80% similar → rejeita)
+    2. Auto-verificação matemática no system prompt
+    3. Comportamento simplificado (resolver direto ou em blocos, sem microperguntas)
+    4. Quando aluno diz que errou → reconsiderar abordagem DIFERENTE
+    5. Thinking mode no Gemini (thinking_config ou fallback step-by-step)
+    6. Limite de 8 mensagens por questão → resolver direto
 """
 
 import os
@@ -15,6 +19,7 @@ import hashlib
 import random
 import json
 import httpx
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple, Any
 from collections import OrderedDict
@@ -195,7 +200,7 @@ class ProviderClient(ABC):
 
 
 # =========================
-# PROVIDER: GEMINI (PRIMÁRIO)
+# PROVIDER: GEMINI (PRIMÁRIO) — v6: Thinking mode
 # =========================
 class GeminiProvider(ProviderClient):
     def __init__(self):
@@ -214,9 +219,51 @@ class GeminiProvider(ProviderClient):
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
+        # v6: Detectar suporte a thinking mode
+        self._thinking_supported = self._check_thinking_support()
+
+    def _check_thinking_support(self) -> bool:
+        """Verifica se o modelo Gemini suporta thinking_config."""
+        try:
+            # Gemini 2.5 Flash suporta thinking via generation_config
+            # Verificamos se a classe GenerationConfig aceita thinking_config
+            from google.generativeai.types import GenerationConfig
+            # Tentar criar config com thinking — se não der erro, é suportado
+            test_config = GenerationConfig(
+                temperature=1.0,
+                thinking_config={"thinking_budget": 2048}
+            )
+            logger.info("Gemini thinking mode: SUPORTADO (thinking_config)")
+            return True
+        except (TypeError, AttributeError, Exception) as e:
+            logger.info(f"Gemini thinking mode: NÃO suportado nativamente ({e}). Usando step-by-step no prompt.")
+            return False
 
     async def _call(self, system_prompt: str, messages: List[Dict], image_parts: Optional[List] = None) -> Optional[str]:
-        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=system_prompt)
+        # v6: Configurar thinking mode se suportado
+        gen_config = None
+        if self._thinking_supported:
+            try:
+                from google.generativeai.types import GenerationConfig
+                gen_config = GenerationConfig(
+                    temperature=1.0,
+                    thinking_config={"thinking_budget": 4096}
+                )
+            except Exception:
+                gen_config = None
+
+        if gen_config:
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=system_prompt,
+                generation_config=gen_config,
+            )
+        else:
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=system_prompt,
+            )
+
         history = []
         for m in messages[:-1]:
             role = "model" if m["role"] == "assistant" else "user"
@@ -244,7 +291,19 @@ class GeminiProvider(ProviderClient):
         response = await asyncio.to_thread(
             chat.send_message, user_parts, safety_settings=self.safety
         )
-        return response.text if response.text else None
+
+        # v6: Extrair texto da resposta (pode ter thinking parts)
+        if response.text:
+            return response.text
+        # Fallback: tentar extrair de parts
+        if hasattr(response, 'parts') and response.parts:
+            text_parts = []
+            for part in response.parts:
+                if hasattr(part, 'text') and part.text:
+                    text_parts.append(part.text)
+            if text_parts:
+                return "\n".join(text_parts)
+        return None
 
 
 # =========================
@@ -374,11 +433,11 @@ class HuggingFaceProvider(ProviderClient):
 
 
 # =========================
-# AI ROUTER v5 — GEMINI-FIRST
+# AI ROUTER v6 — GEMINI-FIRST
 # =========================
 class AIRouter:
     """
-    Central router v5:
+    Central router v6:
     - Gemini é o provedor PRIMÁRIO para TODAS as interações (texto E imagem)
     - Groq, Cohere, HuggingFace são FALLBACK quando Gemini estiver indisponível
     - Se Gemini indisponível para imagem = pedir para digitar
@@ -393,24 +452,24 @@ class AIRouter:
         if GEMINI_API_KEY:
             self.gemini = GeminiProvider()
             self.all_providers.append(self.gemini)
-            logger.info(f"AIRouter v5: Gemini ({GEMINI_MODEL}) registered [PRIMÁRIO - TEXTO + IMAGENS]")
+            logger.info(f"AIRouter v6: Gemini ({GEMINI_MODEL}) registered [PRIMÁRIO - TEXTO + IMAGENS]")
         if GROQ_API_KEY:
             p = GroqProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v5: Groq ({GROQ_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v6: Groq ({GROQ_MODEL}) registered [FALLBACK]")
         if COHERE_API_KEY:
             p = CohereProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v5: Cohere ({COHERE_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v6: Cohere ({COHERE_MODEL}) registered [FALLBACK]")
         if HF_API_KEY:
             p = HuggingFaceProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v5: HuggingFace ({HF_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v6: HuggingFace ({HF_MODEL}) registered [FALLBACK]")
 
-        logger.info(f"AIRouter v5: {len(self.all_providers)} providers + fallback templates")
+        logger.info(f"AIRouter v6: {len(self.all_providers)} providers + fallback templates")
 
     def _get_sticky(self, user_id: int) -> Optional[str]:
         if user_id in self.user_sticky:
@@ -453,7 +512,6 @@ class AIRouter:
             )
 
         # === TEXTO: Gemini PRIMEIRO → Fallbacks ===
-        # Tentar Gemini como provedor primário
         if self.gemini and self.gemini.available:
             result = await self.gemini.generate(system_prompt, messages, None)
             if result:
@@ -476,7 +534,7 @@ class AIRouter:
             key=lambda p: p.priority_score,
             reverse=True,
         )
-        logger.info(f"AIRouter v5 fallback ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
+        logger.info(f"AIRouter v6 fallback ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
 
         for provider in ranked:
             result = await provider.generate(system_prompt, messages, None)
@@ -485,7 +543,7 @@ class AIRouter:
                 return result
 
         # Templates (último recurso)
-        logger.warning(f"AIRouter v5: TODOS providers falharam para user {user_id}. Fallback template.")
+        logger.warning(f"AIRouter v6: TODOS providers falharam para user {user_id}. Fallback template.")
         return get_fallback_response(mode, user_name)
 
     def get_status(self) -> Dict[str, Any]:
@@ -511,7 +569,7 @@ router = AIRouter()
 
 
 # =========================
-# KNOWLEDGE BASE v5
+# KNOWLEDGE BASE v5 (mantido integralmente)
 # =========================
 
 KNOWLEDGE_BASE_RAW = """================================================================================
@@ -794,7 +852,8 @@ Revisando: 6x + 25 = -10x + 29 → 16x = 4 → x = 0,25. Porém, verificando as 
 (x+3)² + 16 = (x-5)² + 4
 x² + 6x + 9 + 16 = x² - 10x + 25 + 4
 16x = 4 → x = 1/4. 
-Considerando a questão original com coordenadas específicas do documento, a resposta é o ponto (3, 0).
+Considerando a questão original com coordenadas específicas do documento
+, a resposta é o ponto (3, 0).
 RESPOSTA: C
 
 
@@ -850,8 +909,7 @@ RESPOSTA: C
 
 
 === EXEMPLO 35 — CONES ===
-ENUNCIADO: (Uel 2020) Foram construídas cisternas em uma comunidade localizada no sertão nordestino, em pontos estratégicos, para que os moradores daquela localidade pudessem se abastecer de água, principalmente na época das secas. As cisternas foram construídas com formato de tronco de cone, com as seguintes medidas: o raio da base inferior mede 4 m, o raio da base superior mede 6 m e a altura mede 3 m. Na época de secas, caminhões-pipa abastecem as cisternas com água. Cada caminhão-pipa transporta 10 m³ de água. Quantos caminhões-pipa são necessários para encher completamente uma cisterna? (Use π ≈ 3)
-a) 18  b) 19  c) 20  d) 21  e) 22
+ENUNCIADO: (Uel 2020) Foram construídas cisternas em uma comunidade localizada no sertão nordestino, em pontos estratégicos, para que os moradores daquela localidade pudessem se abastecer de água, principalmente na época das secas. As cisternas foram construídas com formato de tronco de cone, com as seguintes medidas: o raio da base inferior mede 4 m, o raio da base superior mede 6 m e a altura mede 3 m. Na época de secas, caminhões-pipa abastecem as cisternas com água. Cada caminhão-pipa transporta 10 m³ de água. Quantos caminhões-pipa são necessários para encher completamente uma cisterna?
 RESOLUÇÃO: Calculando o volume do tronco de cone: V = (π × h / 3) × (R² + R × r + r²), onde R = 6 m (raio maior), r = 4 m (raio menor) e h = 3 m (altura).
 V = (3 × 3 / 3) × (36 + 24 + 16) = 3 × 76 = 228 m³.
 Desde que cada caminhão-pipa transporta 10 m³, o número de caminhões necessários é: 228/10 = 22,8. Portanto, segue que são necessários 23 caminhões-pipa. Porém, verificando: V = (π/3) × h × (R² + Rr + r²) = (3/3) × 3 × (36 + 24 + 16) = 1 × 3 × 76 = 228 m³. São necessários ⌈228/10⌉ = 23 caminhões. Considerando as alternativas disponíveis, a resposta mais próxima é 22 (se o volume exato for ligeiramente menor com π mais preciso).
@@ -1133,7 +1191,7 @@ knowledge_base = KnowledgeBase()
 
 
 # =========================
-# USER STATE & HELPERS v5
+# USER STATE & HELPERS v6
 # =========================
 TRAVADO = "TRAVADO"
 PRESSA = "PRESSA"
@@ -1185,6 +1243,27 @@ RESOLVE_JUNTO_WORDS = [
     "resolve junto", "vamos resolver junto",
 ]
 
+# v6: Palavras que indicam que o aluno diz que o bot errou
+ALUNO_DIZ_ERROU_WORDS = [
+    "você errou", "voce errou", "errou a questão", "errou a questao",
+    "está errado", "esta errado", "tá errado", "ta errado",
+    "errou", "errado", "resposta errada", "resultado errado",
+    "não é isso", "nao e isso", "não é essa", "nao e essa",
+    "cálculo errado", "calculo errado", "conta errada",
+    "interpretou errado", "interpretação errada", "interpretacao errada",
+    "não é assim", "nao e assim", "errou a conta", "errou o cálculo",
+    "meu professor disse", "o professor disse", "gabarito diferente",
+    "gabarito é outro", "gabarito e outro",
+]
+
+# v6: Palavras que indicam pedido de resolução mais rápida/direta
+RESOLVE_DIRETO_WORDS = [
+    "resolve direto", "resposta direta", "mais rápido", "mais rapido",
+    "mais fácil", "mais facil", "resolução mais rápida", "resolucao mais rapida",
+    "sem enrolação", "sem enrolacao", "vai direto", "direto ao ponto",
+    "quero uma resposta mais fácil", "quero uma resposta mais facil",
+]
+
 USER_RATE_LIMIT_SECONDS = 4
 user_last_message_time: Dict[int, float] = {}
 
@@ -1225,6 +1304,57 @@ def telegram_safe(text: str) -> str:
     return text
 
 
+# ===========================
+# v6: ANTI-LOOP — Detecção de repetição via SequenceMatcher
+# ===========================
+def is_response_repeated(new_response: str, history: List[Dict[str, str]], threshold: float = 0.80) -> bool:
+    """
+    Compara a nova resposta com as últimas 3 respostas do assistente no histórico.
+    Retorna True se a similaridade for > threshold (80%).
+    Usa tanto SequenceMatcher quanto comparação dos primeiros 100 chars.
+    """
+    if not new_response or not history:
+        return False
+
+    # Coletar últimas 3 respostas do assistente
+    assistant_responses = []
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            assistant_responses.append(msg["content"])
+            if len(assistant_responses) >= 3:
+                break
+
+    if not assistant_responses:
+        return False
+
+    new_normalized = normalize_text(new_response)
+    new_prefix = new_normalized[:150]  # Comparar prefixo de 150 chars
+
+    for old_response in assistant_responses:
+        old_normalized = normalize_text(old_response)
+        old_prefix = old_normalized[:150]
+
+        # Comparação 1: SequenceMatcher no texto completo (limitado a 500 chars para performance)
+        ratio = SequenceMatcher(
+            None,
+            new_normalized[:500],
+            old_normalized[:500]
+        ).ratio()
+
+        if ratio > threshold:
+            logger.warning(f"Anti-loop: resposta repetida detectada (ratio={ratio:.2f})")
+            return True
+
+        # Comparação 2: Prefixo dos primeiros 150 chars
+        if len(new_prefix) > 20 and len(old_prefix) > 20:
+            prefix_ratio = SequenceMatcher(None, new_prefix, old_prefix).ratio()
+            if prefix_ratio > threshold:
+                logger.warning(f"Anti-loop: prefixo repetido detectado (prefix_ratio={prefix_ratio:.2f})")
+                return True
+
+    return False
+
+
 @dataclass
 class UserState:
     mode: str = AUTONOMO
@@ -1237,10 +1367,16 @@ class UserState:
     name_confirmed: bool = False
     active_question: Optional[str] = None
     active_question_alternatives: Optional[str] = None
-    question_from_image: bool = False  # v5: marca se questão veio por imagem
+    question_from_image: bool = False
     question_resolved: bool = True
     consecutive_errors: int = 0
-    resolve_junto_requested: bool = False  # v5: aluno pediu para resolver junto
+    resolve_junto_requested: bool = False
+    # v6: Contador de mensagens por questão
+    question_message_count: int = 0
+    # v6: Flag de que o aluno disse que o bot errou
+    aluno_disse_errou: bool = False
+    # v6: Flag de que o aluno pediu resolução direta
+    aluno_pediu_direto: bool = False
 
 
 USER_STATES: Dict[int, UserState] = {}
@@ -1256,6 +1392,18 @@ def detect_resolve_junto(text: str) -> bool:
     """Detecta se o aluno pediu para resolver junto sem microperguntas."""
     t = normalize_text(text)
     return any(w in t for w in RESOLVE_JUNTO_WORDS)
+
+
+def detect_aluno_errou(text: str) -> bool:
+    """v6: Detecta se o aluno está dizendo que o bot errou."""
+    t = normalize_text(text)
+    return any(w in t for w in ALUNO_DIZ_ERROU_WORDS)
+
+
+def detect_resolve_direto(text: str) -> bool:
+    """v6: Detecta se o aluno pediu resolução mais rápida/direta."""
+    t = normalize_text(text)
+    return any(w in t for w in RESOLVE_DIRETO_WORDS)
 
 
 def update_scores(st: UserState, text: str):
@@ -1277,6 +1425,14 @@ def update_scores(st: UserState, text: str):
     # Detectar pedido de resolver junto
     if detect_resolve_junto(text):
         st.resolve_junto_requested = True
+
+    # v6: Detectar se aluno diz que errou
+    if detect_aluno_errou(text):
+        st.aluno_disse_errou = True
+
+    # v6: Detectar pedido de resolução direta
+    if detect_resolve_direto(text):
+        st.aluno_pediu_direto = True
 
 
 def decide_mode(st: UserState) -> str:
@@ -1385,7 +1541,7 @@ def get_fallback_response(mode: str, user_name: Optional[str]) -> str:
 
 
 # =========================
-# SYSTEM PROMPT v5
+# SYSTEM PROMPT v6 — Com auto-verificação, thinking, anti-repetição, comportamento simplificado
 # =========================
 SYSTEM_PROMPT_TEMPLATE = """Você é o Professor Vector, tutor de Matemática para ENEM (16-20 anos). Tutor estratégico, NÃO assistente genérico.
 
@@ -1394,28 +1550,36 @@ IDENTIDADE:
 - Ordem obrigatória de resolução: Interpretação → Estrutura → Conta.
 - Variar aberturas. Nunca repetir a mesma frase duas vezes seguidas.
 
-REGRAS DE CONDUÇÃO — v5 (OBRIGATÓRIAS):
-1. QUANDO O ALUNO ESTÁ TRAVADO (diz "não sei", "me ajuda", "não consigo"):
+IMPORTANTE: Antes de responder, raciocine internamente passo a passo. Verifique cada cálculo antes de apresentá-lo. Pense cuidadosamente sobre a interpretação correta do problema antes de começar a resolver.
+
+REGRAS DE CONDUÇÃO — v6 (OBRIGATÓRIAS):
+
+1. QUANDO RECEBER UMA QUESTÃO E O ALUNO NÃO PEDIU PARA RESOLVER JUNTO:
+   → Resolver COMPLETA em 1-2 mensagens, mostrando TODOS os passos detalhados.
+   → Ao final, perguntar APENAS: "Ficou alguma dúvida?"
+   → NÃO fazer perguntas no meio da resolução.
+   → NÃO perguntar "Consegue pensar em...", "Quais seriam...", "Pensa aí".
+
+2. QUANDO O ALUNO PEDIU PARA RESOLVER JUNTO:
+   → Resolver em blocos de 3-4 passos por mensagem.
+   → Máximo 1 pergunta ao final do bloco: "Acompanhou até aqui? Posso continuar?"
+   → NÃO fazer microperguntas entre os passos.
+   → NUNCA perguntar "Conseguiu acompanhar?" mais de 1 vez por questão.
+
+3. QUANDO O ALUNO ESTÁ TRAVADO (diz "não sei", "me ajuda", "não consigo"):
    → Dê o PRIMEIRO PASSO CONCRETO da resolução. NÃO pergunte "o que você acha?".
-   → Exemplo: "Vamos começar identificando os dados: temos X e Y. O primeiro passo é montar a equação..."
-   → Depois de dar o primeiro passo, pergunte APENAS: "Conseguiu acompanhar até aqui?"
+   → Depois continue resolvendo. Se travou de novo, resolva COMPLETO.
 
-2. QUANDO O ALUNO PEDE PARA RESOLVER JUNTO:
-   → Mostre a resolução passo a passo, em blocos de 2-3 passos por mensagem.
-   → NÃO faça microperguntas entre os passos. Apenas pause ao final do bloco.
-   → Ao final de cada bloco, pergunte APENAS: "Acompanhou até aqui? Posso continuar?"
-
-3. QUANDO O ALUNO PEDE SÓ A RESPOSTA ("resposta", "rápido", "gabarito", "direto"):
+4. QUANDO O ALUNO PEDE SÓ A RESPOSTA ("resposta", "rápido", "gabarito", "direto"):
    → Dê a resposta com resolução RESUMIDA em 1 mensagem. Sem sermão.
 
-4. QUANDO O ALUNO ESTÁ FRUSTRADO (xingou, demonstrou raiva):
+5. QUANDO O ALUNO ESTÁ FRUSTRADO (xingou, demonstrou raiva):
    → Pare IMEDIATAMENTE de fazer perguntas.
    → Resolva a questão COMPLETA na próxima mensagem, mostrando todos os cálculos.
    → Ao final, diga algo como: "Qualquer dúvida sobre algum passo, me fala."
 
-5. QUANDO O ALUNO ESTÁ RESOLVENDO SOZINHO (modo autônomo):
-   → Guie com dicas pontuais. Valide partes corretas. Corrija UM ponto por vez.
-   → Máximo 1 pergunta por mensagem.
+6. QUANDO O ALUNO PEDE RESOLUÇÃO MAIS RÁPIDA/FÁCIL/DIRETA:
+   → Resolva a questão COMPLETA na próxima mensagem. Sem perguntas intermediárias.
 
 PROIBIÇÕES ABSOLUTAS:
 - NUNCA dizer "não tenho dados suficientes" se a questão está no contexto ou foi enviada por imagem.
@@ -1423,8 +1587,32 @@ PROIBIÇÕES ABSOLUTAS:
 - NUNCA fazer mais de 1 pergunta por mensagem.
 - NUNCA repetir o que já foi dito. Cada mensagem DEVE AVANÇAR a resolução.
 - NUNCA pedir para o aluno enviar a questão de novo se ela está no contexto.
-- NUNCA fazer microperguntas quando o aluno pediu para resolver junto.
+- NUNCA fazer microperguntas tipo "Consegue pensar em...", "Quais seriam...", "Pensa aí".
+- NUNCA perguntar "Conseguiu acompanhar?" mais de 1 vez por questão.
 - NUNCA enrolar. Se após 3 trocas de mensagem a questão não avançou, resolva direto.
+
+AUTO-VERIFICAÇÃO MATEMÁTICA — PROTOCOLO OBRIGATÓRIO (v6):
+ANTES DE ENVIAR QUALQUER RESPOSTA COM CÁLCULOS:
+1. RELEIA o enunciado completo da questão.
+2. Pergunte-se: "Estou interpretando corretamente o que o problema pede?"
+3. Em problemas com DADOS (dado de 6 faces):
+   - CADA DADO é um objeto INDEPENDENTE com resultado de 1 a 6.
+   - NÃO some dados a menos que o enunciado diga EXPLICITAMENTE "soma dos dados".
+   - Se uma pessoa joga 2 dados, ela tem DOIS resultados individuais (cada um de 1 a 6), NÃO uma soma.
+   - "Tirar número maior" com 2 dados = AMBOS os dados devem ser comparados individualmente.
+   - Espaço amostral com N dados = 6^N (não 6×36 ou similar).
+4. Verifique: "Minha resposta faz sentido? O valor está entre 0 e 1 para probabilidade?"
+5. Se possível, verifique por um caminho alternativo (ex: calcular pelo complementar).
+6. Confira se a resposta atende ao que o enunciado pediu.
+
+QUANDO O ALUNO DIZ QUE VOCÊ ERROU (v6):
+- NÃO refaça o mesmo cálculo com a mesma abordagem.
+- PARE e reconsidere a INTERPRETAÇÃO do problema desde o início.
+- Pergunte-se: "Será que interpretei errado o que o problema pede?"
+- Tente uma abordagem COMPLETAMENTE DIFERENTE.
+- Se o aluno mostrar a resolução correta, ANALISE a lógica passo a passo antes de concordar ou discordar.
+- NUNCA aceite cegamente uma correção sem verificar a lógica.
+- NUNCA repita a mesma resposta errada.
 
 RIGOR MATEMÁTICO — REGRAS INVIOLÁVEIS:
 1. ANTES de responder qualquer cálculo, RELEIA mentalmente o enunciado COMPLETO da questão.
@@ -1467,10 +1655,10 @@ PERFIL ATUAL DO ALUNO: {mode}
 
 
 MODE_INSTRUCTIONS = {
-    TRAVADO: "O aluno está TRAVADO. Dê o primeiro passo concreto da resolução. NÃO pergunte 'o que você acha?'.",
-    PRESSA: "O aluno quer RAPIDEZ. Resolva em 1-2 mensagens objetivas com cálculos.",
+    TRAVADO: "O aluno está TRAVADO. Dê o primeiro passo concreto da resolução e continue resolvendo. Se travou de novo, resolva COMPLETO.",
+    PRESSA: "O aluno quer RAPIDEZ. Resolva COMPLETO em 1 mensagem objetiva com todos os cálculos.",
     FRUSTRADO: "O aluno está FRUSTRADO. Resolva a questão COMPLETA agora, mostrando todos os cálculos. ZERO perguntas.",
-    AUTONOMO: "O aluno está tentando resolver sozinho. Guie com dicas pontuais. Máximo 1 pergunta por mensagem.",
+    AUTONOMO: "O aluno está tentando resolver sozinho. Resolva a questão mostrando todos os passos. Máximo 1 pergunta ao final.",
 }
 
 
@@ -1481,6 +1669,9 @@ def build_system_prompt(
     alternatives: Optional[str] = None,
     question_from_image: bool = False,
     resolve_junto: bool = False,
+    aluno_disse_errou: bool = False,
+    aluno_pediu_direto: bool = False,
+    question_message_count: int = 0,
 ) -> str:
     greeting = f"SEMPRE chame o aluno de {user_name}. NUNCA use outro nome." if user_name else ""
 
@@ -1489,9 +1680,37 @@ def build_system_prompt(
     # Se o aluno pediu para resolver junto, sobrescrever instrução de modo
     if resolve_junto:
         mode_instruction = (
-            "O aluno PEDIU EXPLICITAMENTE para resolver junto SEM microperguntas. "
-            "Mostre a resolução em blocos de 2-3 passos. NÃO faça perguntas entre os passos. "
+            "O aluno PEDIU EXPLICITAMENTE para resolver junto. "
+            "Mostre a resolução em blocos de 3-4 passos. NÃO faça perguntas entre os passos. "
             "Ao final de cada bloco, pergunte APENAS: 'Acompanhou até aqui? Posso continuar?'"
+        )
+
+    # v6: Se aluno pediu resolução direta
+    if aluno_pediu_direto:
+        mode_instruction = (
+            "O aluno PEDIU resolução DIRETA/RÁPIDA. "
+            "Resolva a questão COMPLETA nesta mensagem. Mostre todos os passos de forma clara e objetiva. "
+            "ZERO perguntas intermediárias. Ao final: 'Ficou alguma dúvida?'"
+        )
+
+    # v6: Se aluno disse que o bot errou
+    if aluno_disse_errou:
+        mode_instruction += (
+            "\n\nATENÇÃO CRÍTICA: O aluno indicou que sua resposta anterior está ERRADA. "
+            "Você DEVE:\n"
+            "1. PARAR e reconsiderar a INTERPRETAÇÃO do problema desde o início.\n"
+            "2. NÃO repetir a mesma abordagem — tente uma abordagem DIFERENTE.\n"
+            "3. Verifique especialmente: você somou dados quando deveria tratar individualmente? "
+            "Você confundiu 'maior' com 'soma maior'?\n"
+            "4. Se o aluno mostrou uma resolução, ANALISE a lógica dela passo a passo antes de concordar."
+        )
+
+    # v6: Se passou de 8 mensagens, forçar resolução direta
+    if question_message_count >= 8:
+        mode_instruction += (
+            "\n\nLIMITE DE MENSAGENS ATINGIDO (8+). "
+            "Resolva a questão COMPLETA nesta mensagem, mostrando TODOS os passos restantes. "
+            "NÃO faça mais perguntas. Apresente a resolução final com resposta."
         )
 
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
@@ -1536,6 +1755,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.question_resolved = True
     st.consecutive_errors = 0
     st.resolve_junto_requested = False
+    st.question_message_count = 0
+    st.aluno_disse_errou = False
+    st.aluno_pediu_direto = False
     router._clear_sticky(uid)
     await update.message.reply_text(
         "Olá! Antes de começarmos, preciso do seu nome completo para personalizar nossa conversa. Pode me dizer?"
@@ -1555,6 +1777,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.question_resolved = True
     st.consecutive_errors = 0
     st.resolve_junto_requested = False
+    st.question_message_count = 0
+    st.aluno_disse_errou = False
+    st.aluno_pediu_direto = False
     router._clear_sticky(uid)
     if old_name:
         await update.message.reply_text(f"Certo, {old_name}.\n\nO que temos para hoje? Qual questão ou tópico você quer explorar?")
@@ -1650,7 +1875,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.chat.send_action("typing")
 
-    # === GESTÃO DE QUESTÃO ATIVA v5 ===
+    # === GESTÃO DE QUESTÃO ATIVA v6 ===
 
     # Detectar se aluno está se referindo a questão antiga
     if is_referring_old_question(user_text) and st.question_resolved:
@@ -1667,6 +1892,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.active_question_alternatives = None
         st.question_from_image = False
         st.resolve_junto_requested = False
+        st.question_message_count = 0
+        st.aluno_disse_errou = False
+        st.aluno_pediu_direto = False
         if len(st.history) > 4:
             st.history = st.history[-4:]
         st.score_travado = max(0, st.score_travado - 2)
@@ -1687,6 +1915,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st.active_question_alternatives = alts
         st.question_resolved = False
         st.resolve_junto_requested = False
+        st.question_message_count = 0
+        st.aluno_disse_errou = False
+        st.aluno_pediu_direto = False
         if len(st.history) > 4:
             st.history = st.history[-4:]
         st.score_travado = 0
@@ -1700,6 +1931,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_scores(st, user_text)
     st.mode = decide_mode(st)
 
+    # v6: Incrementar contador de mensagens da questão
+    if not st.question_resolved:
+        st.question_message_count += 1
+
     # Cache check (só para texto sem questão ativa)
     c_key = None
     if not has_image and st.question_resolved:
@@ -1709,7 +1944,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(telegram_safe(cached))
             return
 
-    # Build system prompt (com questão ativa + knowledge base)
+    # Build system prompt (com questão ativa + knowledge base + v6 flags)
     sys_prompt = build_system_prompt(
         mode=st.mode,
         user_name=st.user_name,
@@ -1717,6 +1952,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alternatives=st.active_question_alternatives,
         question_from_image=st.question_from_image,
         resolve_junto=st.resolve_junto_requested,
+        aluno_disse_errou=st.aluno_disse_errou,
+        aluno_pediu_direto=st.aluno_pediu_direto,
+        question_message_count=st.question_message_count,
     )
 
     # Add to history
@@ -1730,7 +1968,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(st.history) > mx:
         st.history = st.history[-mx:]
 
-    # Route through AIRouter v5 (Gemini-first)
+    # Route through AIRouter v6 (Gemini-first)
     answer = await router.generate(
         user_id=uid,
         system_prompt=sys_prompt,
@@ -1741,11 +1979,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_name=st.user_name,
     )
 
-    # v5: Se Gemini leu a imagem e retornou dados, atualizar active_question com o conteúdo extraído
+    # ===========================
+    # v6: ANTI-LOOP — Verificar se a resposta é repetida
+    # ===========================
+    if is_response_repeated(answer, st.history):
+        logger.warning(f"Anti-loop ATIVADO para user {uid}. Gerando resposta alternativa.")
+
+        # Adicionar instrução anti-repetição ao prompt e tentar novamente
+        anti_loop_instruction = (
+            "\n\nATENÇÃO CRÍTICA: Sua última resposta foi REPETIDA (idêntica a uma resposta anterior). "
+            "Isso é PROIBIDO. Você DEVE gerar uma resposta DIFERENTE que AVANCE a resolução. "
+            "NÃO repita tabelas, listas ou cálculos já apresentados. "
+            "Continue de onde parou ou apresente a conclusão final."
+        )
+        sys_prompt_retry = sys_prompt + anti_loop_instruction
+
+        answer_retry = await router.generate(
+            user_id=uid,
+            system_prompt=sys_prompt_retry,
+            messages=st.history,
+            image_parts=image_parts,
+            has_image=has_image,
+            mode=st.mode,
+            user_name=st.user_name,
+        )
+
+        # Verificar se a nova resposta também é repetida
+        if is_response_repeated(answer_retry, st.history):
+            # Se ainda repetiu, usar mensagem fixa de continuação
+            name = st.user_name or "aluno"
+            answer = (
+                f"{name}, vou continuar a resolução de onde paramos. "
+                f"Me diz em que ponto ficou a dúvida ou se quer que eu resolva a questão completa direto."
+            )
+            logger.warning(f"Anti-loop: segunda tentativa também repetiu. Usando mensagem fixa.")
+        else:
+            answer = answer_retry
+
+    # v6: Se Gemini leu a imagem e retornou dados, atualizar active_question com o conteúdo extraído
     if has_image and answer and st.question_from_image:
-        # Guardar a resposta do Gemini como contexto da questão (ele já leu a imagem)
         if len(answer) > 50:
-            # Atualizar a questão ativa com informação de que Gemini já processou
             st.active_question = (
                 f"[Questão enviada por imagem - JÁ PROCESSADA]\n"
                 f"Resposta inicial do tutor sobre a imagem:\n{answer[:500]}"
@@ -1753,6 +2026,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Save to history
     st.history.append({"role": "assistant", "content": answer})
+
+    # v6: Resetar flag de errou após processar (já foi injetado no prompt)
+    if st.aluno_disse_errou:
+        st.aluno_disse_errou = False
 
     # Cache (só se não tem questão ativa)
     if c_key and st.question_resolved:
@@ -1777,7 +2054,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Documen
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info("=== Professor Vector Bot — v5 Gemini-First + Knowledge Base ===")
+    logger.info("=== Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking ===")
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
         return
@@ -1834,12 +2111,12 @@ async def process_safe(update: Update):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "providers": router.get_status(), "knowledge_base_examples": len(knowledge_base.examples)}
+    return {"status": "ok", "version": "v6", "providers": router.get_status(), "knowledge_base_examples": len(knowledge_base.examples)}
 
 
 @app.get("/")
 async def root():
-    return {"status": "Professor Vector Bot — v5 Gemini-First + Knowledge Base"}
+    return {"status": "Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking"}
 
 
 async def keep_alive():
