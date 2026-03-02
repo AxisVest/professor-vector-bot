@@ -1,13 +1,13 @@
 """
-Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking
+Professor Vector Bot — v7 Web Search + Anti-Loop + Auto-Verificação + Thinking
 Providers: Gemini (PRIMÁRIO para TUDO) | Groq | Cohere | HuggingFace (FALLBACK)
-v6: Correções críticas sobre v5:
-    1. Anti-loop de repetição (SequenceMatcher, >80% similar → rejeita)
-    2. Auto-verificação matemática no system prompt
-    3. Comportamento simplificado (resolver direto ou em blocos, sem microperguntas)
-    4. Quando aluno diz que errou → reconsiderar abordagem DIFERENTE
-    5. Thinking mode no Gemini (thinking_config ou fallback step-by-step)
-    6. Limite de 8 mensagens por questão → resolver direto
+v7: Novidade sobre v6:
+    1. WEB SEARCH para resoluções — busca no Google por resoluções antes de responder
+    2. Extração de conteúdo de páginas web (sites educacionais confiáveis)
+    3. Geração de keywords otimizadas via Gemini para busca
+    4. Injeção de conteúdo web no system prompt como referência
+    5. Busca assíncrona com timeout de 10s e fallback gracioso
+    6. Mantém TUDO do v6: anti-loop, auto-verificação, thinking, knowledge base, etc.
 """
 
 import os
@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple, Any
 from collections import OrderedDict
 from abc import ABC, abstractmethod
+from urllib.parse import quote_plus, urlparse, urljoin
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
@@ -225,10 +226,7 @@ class GeminiProvider(ProviderClient):
     def _check_thinking_support(self) -> bool:
         """Verifica se o modelo Gemini suporta thinking_config."""
         try:
-            # Gemini 2.5 Flash suporta thinking via generation_config
-            # Verificamos se a classe GenerationConfig aceita thinking_config
             from google.generativeai.types import GenerationConfig
-            # Tentar criar config com thinking — se não der erro, é suportado
             test_config = GenerationConfig(
                 temperature=1.0,
                 thinking_config={"thinking_budget": 2048}
@@ -275,7 +273,7 @@ class GeminiProvider(ProviderClient):
         if image_parts:
             user_parts.extend(image_parts)
             last_text = messages[-1]["content"] if messages else ""
-            if last_text and not last_text.startswith("[Imagem"):
+            if last_text and not last_text.startswith("["):
                 user_parts.append(last_text)
             else:
                 user_parts.append(
@@ -452,24 +450,24 @@ class AIRouter:
         if GEMINI_API_KEY:
             self.gemini = GeminiProvider()
             self.all_providers.append(self.gemini)
-            logger.info(f"AIRouter v6: Gemini ({GEMINI_MODEL}) registered [PRIMÁRIO - TEXTO + IMAGENS]")
+            logger.info(f"AIRouter v7: Gemini ({GEMINI_MODEL}) registered [PRIMÁRIO - TEXTO + IMAGENS]")
         if GROQ_API_KEY:
             p = GroqProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v6: Groq ({GROQ_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v7: Groq ({GROQ_MODEL}) registered [FALLBACK]")
         if COHERE_API_KEY:
             p = CohereProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v6: Cohere ({COHERE_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v7: Cohere ({COHERE_MODEL}) registered [FALLBACK]")
         if HF_API_KEY:
             p = HuggingFaceProvider()
             self.fallback_providers.append(p)
             self.all_providers.append(p)
-            logger.info(f"AIRouter v6: HuggingFace ({HF_MODEL}) registered [FALLBACK]")
+            logger.info(f"AIRouter v7: HuggingFace ({HF_MODEL}) registered [FALLBACK]")
 
-        logger.info(f"AIRouter v6: {len(self.all_providers)} providers + fallback templates")
+        logger.info(f"AIRouter v7: {len(self.all_providers)} providers + fallback templates")
 
     def _get_sticky(self, user_id: int) -> Optional[str]:
         if user_id in self.user_sticky:
@@ -534,7 +532,7 @@ class AIRouter:
             key=lambda p: p.priority_score,
             reverse=True,
         )
-        logger.info(f"AIRouter v6 fallback ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
+        logger.info(f"AIRouter v7 fallback ranking: {[f'{p.name}({p.priority_score:.2f})' for p in ranked]}")
 
         for provider in ranked:
             result = await provider.generate(system_prompt, messages, None)
@@ -543,7 +541,7 @@ class AIRouter:
                 return result
 
         # Templates (último recurso)
-        logger.warning(f"AIRouter v6: TODOS providers falharam para user {user_id}. Fallback template.")
+        logger.warning(f"AIRouter v7: TODOS providers falharam para user {user_id}. Fallback template.")
         return get_fallback_response(mode, user_name)
 
     def get_status(self) -> Dict[str, Any]:
@@ -566,6 +564,485 @@ class AIRouter:
 # GLOBAL ROUTER INSTANCE
 # =========================
 router = AIRouter()
+
+
+# ============================================================================
+# v7: WEB SEARCH ENGINE — Busca resoluções na web antes de responder
+# ============================================================================
+
+TRUSTED_SITES = [
+    "descomplica.com.br",
+    "brasilescola.uol.com.br",
+    "todamateria.com.br",
+    "mesalva.com",
+    "mundoeducacao.uol.com.br",
+    "stoodi.com.br",
+    "exercicios.brasilescola.uol.com.br",
+    "sufrfrj.com.br",
+    "professorferretto.com.br",
+    "matematicadidatica.com.br",
+    "khan.academy",
+    "pt.khanacademy.org",
+    "infoescola.com",
+    "educamaisbrasil.com.br",
+    "beduka.com",
+    "querobolsa.com.br",
+    "soeducacao.com.br",
+    "matematica.vc",
+    "obfrfrj.com.br",
+]
+
+# Timeout global para operações de web search
+WEB_SEARCH_TIMEOUT = 10  # segundos
+WEB_CONTENT_MAX_CHARS = 4000  # limite total de conteúdo web injetado no prompt
+WEB_PAGE_MAX_CHARS = 2000  # limite por página individual
+
+
+async def generate_search_query(question_text: str) -> str:
+    """
+    v7: Usa Gemini para gerar query de busca otimizada a partir da questão.
+    Fallback: extrai palavras-chave manualmente se Gemini falhar.
+    """
+    try:
+        if not GEMINI_API_KEY:
+            return _fallback_keywords(question_text)
+
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL)
+        prompt = (
+            "Extraia 3-5 palavras-chave para buscar a resolução desta questão de matemática no Google. "
+            "Retorne APENAS as palavras-chave separadas por espaço, sem explicação, sem aspas, sem pontuação extra.\n"
+            "Inclua o tema matemático (ex: probabilidade, função afim, porcentagem) e termos-chave do enunciado.\n"
+            "Se for questão de ENEM ou vestibular, inclua 'ENEM' ou o nome do vestibular.\n\n"
+            f"Questão: {question_text[:800]}"
+        )
+        response = await asyncio.to_thread(
+            model.generate_content, prompt
+        )
+        if response and response.text:
+            keywords = response.text.strip()
+            # Limpar: remover aspas, pontuação excessiva
+            keywords = re.sub(r'["\'\[\]\(\)\{\}]', '', keywords)
+            keywords = re.sub(r'\s+', ' ', keywords).strip()
+            if len(keywords) > 5:
+                logger.info(f"WebSearch: Gemini keywords: '{keywords}'")
+                return keywords
+    except Exception as e:
+        logger.warning(f"WebSearch: Gemini keyword generation failed: {e}")
+
+    return _fallback_keywords(question_text)
+
+
+def _fallback_keywords(question_text: str) -> str:
+    """Extração manual de palavras-chave quando Gemini não está disponível."""
+    text = question_text.lower()
+    keywords = []
+
+    # Detectar tema
+    math_terms = {
+        "probabilidade": ["probabilidade", "provável", "chances", "dado", "dados", "moeda", "sorteio", "urna"],
+        "porcentagem": ["porcentagem", "percentual", "%", "desconto", "aumento", "lucro"],
+        "juros": ["juros", "montante", "capital", "investimento", "rendimento"],
+        "função afim": ["função afim", "linear", "primeiro grau", "reta"],
+        "função quadrática": ["função quadrática", "segundo grau", "parábola", "bhaskara"],
+        "geometria": ["triângulo", "círculo", "área", "perímetro", "volume", "cilindro", "cone", "esfera"],
+        "trigonometria": ["seno", "cosseno", "tangente", "trigonometria"],
+        "combinatória": ["combinação", "arranjo", "permutação", "fatorial"],
+        "estatística": ["média", "mediana", "moda", "desvio padrão"],
+        "PA PG": ["progressão aritmética", "progressão geométrica", "pa", "pg"],
+    }
+
+    for tema, termos in math_terms.items():
+        if any(t in text for t in termos):
+            keywords.append(tema)
+            break
+
+    # Detectar vestibular
+    if "enem" in text:
+        keywords.append("ENEM")
+    elif "fgv" in text:
+        keywords.append("FGV")
+    elif "unicamp" in text:
+        keywords.append("UNICAMP")
+    elif "fuvest" in text:
+        keywords.append("FUVEST")
+
+    # Extrair números e termos relevantes
+    numbers = re.findall(r'\d+', text[:200])
+    if numbers:
+        keywords.extend(numbers[:3])
+
+    # Palavras significativas (> 4 chars, não stopwords)
+    stopwords = {
+        "para", "como", "qual", "quais", "cada", "esse", "essa", "este", "esta",
+        "mais", "menos", "muito", "pouco", "todos", "todas", "pode", "deve",
+        "será", "seria", "sendo", "foram", "foram", "sobre", "entre", "desde",
+        "após", "antes", "durante", "quando", "onde", "porque", "porém",
+        "então", "assim", "também", "ainda", "apenas", "mesmo", "outro",
+        "outra", "outros", "outras", "algum", "alguma", "nenhum", "nenhuma",
+        "todo", "toda", "aquele", "aquela", "aquilo", "isso", "isto",
+        "dele", "dela", "deles", "delas", "nele", "nela", "neles", "nelas",
+        "com", "sem", "por", "que", "não", "uma", "uns", "umas",
+    }
+    words = re.findall(r'[a-záàâãéèêíïóôõúüç]+', text[:300])
+    significant = [w for w in words if len(w) > 4 and w not in stopwords]
+    keywords.extend(significant[:4])
+
+    result = " ".join(keywords) if keywords else "resolução questão matemática"
+    logger.info(f"WebSearch: fallback keywords: '{result}'")
+    return result
+
+
+async def web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
+    """
+    v7: Busca no Google e retorna lista de {title, url, snippet}.
+    Usa httpx direto no Google Search com parsing de HTML.
+    """
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+    params = {
+        "q": query,
+        "num": num_results + 5,  # pedir mais para compensar filtragem
+        "hl": "pt-BR",
+        "gl": "br",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=WEB_SEARCH_TIMEOUT,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            resp = await client.get("https://www.google.com/search", params=params)
+
+            if resp.status_code != 200:
+                logger.warning(f"WebSearch: Google returned HTTP {resp.status_code}")
+                return results
+
+            html = resp.text
+
+            # === Parsing dos resultados do Google ===
+            # Método 1: Extrair links de resultados orgânicos via regex
+            # Os resultados do Google ficam em tags <a> com href começando por /url?q=
+            url_pattern = re.findall(r'/url\?q=(https?://[^&"]+?)&', html)
+
+            # Método 2: Extrair diretamente URLs de <a href="https://...">
+            direct_urls = re.findall(r'<a[^>]+href="(https?://(?:www\.)?[^"]+)"[^>]*>', html)
+
+            # Combinar e deduplicar
+            all_urls = []
+            seen = set()
+            for url in url_pattern + direct_urls:
+                # Filtrar URLs do Google, cache, etc.
+                if any(skip in url for skip in [
+                    "google.com", "googleapis.com", "gstatic.com",
+                    "youtube.com", "webcache", "translate.google",
+                    "accounts.google", "support.google", "maps.google",
+                ]):
+                    continue
+                if url not in seen:
+                    seen.add(url)
+                    all_urls.append(url)
+
+            # Extrair títulos e snippets via regex
+            # Padrão para títulos: <h3 class="...">texto</h3>
+            titles = re.findall(r'<h3[^>]*>(.*?)</h3>', html, re.DOTALL)
+            titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles]
+
+            # Padrão para snippets: texto dentro de <span> após os resultados
+            snippets_raw = re.findall(
+                r'<span[^>]*class="[^"]*"[^>]*>((?:(?!<span).)*?(?:resolução|questão|matemática|enem|calcul|probabilidade|porcentagem|função|geometria|trigonometria)(?:(?!<span).)*?)</span>',
+                html, re.DOTALL | re.IGNORECASE
+            )
+            snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets_raw]
+
+            # Montar resultados
+            for i, url in enumerate(all_urls[:num_results]):
+                title = titles[i] if i < len(titles) else ""
+                snippet = snippets[i] if i < len(snippets) else ""
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                })
+
+            logger.info(f"WebSearch: found {len(results)} results for query '{query}'")
+
+    except httpx.TimeoutException:
+        logger.warning(f"WebSearch: timeout searching Google for '{query}'")
+    except Exception as e:
+        logger.warning(f"WebSearch: error searching Google: {type(e).__name__}: {e}")
+
+    return results
+
+
+async def extract_page_content(url: str, max_chars: int = WEB_PAGE_MAX_CHARS) -> str:
+    """
+    v7: Extrai texto principal de uma página web.
+    Usa httpx para baixar e regex para limpar HTML.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=WEB_SEARCH_TIMEOUT,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            resp = await client.get(url)
+
+            if resp.status_code != 200:
+                logger.warning(f"WebSearch: page {url} returned HTTP {resp.status_code}")
+                return ""
+
+            html = resp.text
+
+            # === Limpeza do HTML ===
+
+            # Remover scripts e styles
+            html = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+
+            # Remover comentários HTML
+            html = re.sub(r'<!--.*?-->', ' ', html, flags=re.DOTALL)
+
+            # Remover header, nav, footer, aside (conteúdo não-principal)
+            html = re.sub(r'<header[^>]*>.*?</header>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<nav[^>]*>.*?</nav>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<footer[^>]*>.*?</footer>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<aside[^>]*>.*?</aside>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
+
+            # Tentar extrair conteúdo principal (article, main, ou div com class de conteúdo)
+            main_content = ""
+
+            # Prioridade 1: <article>
+            article_match = re.search(r'<article[^>]*>(.*?)</article>', html, re.DOTALL | re.IGNORECASE)
+            if article_match:
+                main_content = article_match.group(1)
+
+            # Prioridade 2: <main>
+            if not main_content:
+                main_match = re.search(r'<main[^>]*>(.*?)</main>', html, re.DOTALL | re.IGNORECASE)
+                if main_match:
+                    main_content = main_match.group(1)
+
+            # Prioridade 3: div com class contendo "content", "post", "article", "text"
+            if not main_content:
+                content_match = re.search(
+                    r'<div[^>]*class="[^"]*(?:content|post-body|article-body|entry-content|text-content|materia|resolucao)[^"]*"[^>]*>(.*?)</div>',
+                    html, re.DOTALL | re.IGNORECASE
+                )
+                if content_match:
+                    main_content = content_match.group(1)
+
+            # Fallback: usar body inteiro
+            if not main_content:
+                body_match = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE)
+                if body_match:
+                    main_content = body_match.group(1)
+                else:
+                    main_content = html
+
+            # Converter <br>, <p>, <div>, <li>, <h1-h6> em quebras de linha
+            text = re.sub(r'<br\s*/?>', '\n', main_content, flags=re.IGNORECASE)
+            text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</li>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</h[1-6]>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'<h[1-6][^>]*>', '\n', text, flags=re.IGNORECASE)
+
+            # Remover todas as tags HTML restantes
+            text = re.sub(r'<[^>]+>', ' ', text)
+
+            # Decodificar entidades HTML comuns
+            text = text.replace('&nbsp;', ' ')
+            text = text.replace('&amp;', '&')
+            text = text.replace('&lt;', '<')
+            text = text.replace('&gt;', '>')
+            text = text.replace('&quot;', '"')
+            text = text.replace('&#39;', "'")
+            text = text.replace('&apos;', "'")
+            text = text.replace('&mdash;', '—')
+            text = text.replace('&ndash;', '–')
+            text = text.replace('&times;', '×')
+            text = text.replace('&divide;', '÷')
+            text = text.replace('&plusmn;', '±')
+            text = text.replace('&sup2;', '²')
+            text = text.replace('&sup3;', '³')
+            text = text.replace('&frac12;', '½')
+            text = text.replace('&frac14;', '¼')
+            text = text.replace('&frac34;', '¾')
+            text = text.replace('&pi;', 'π')
+            text = text.replace('&radic;', '√')
+            text = text.replace('&infin;', '∞')
+
+            # Decodificar entidades numéricas HTML
+            text = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))) if int(m.group(1)) < 65536 else '', text)
+            text = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)) if int(m.group(1), 16) < 65536 else '', text)
+
+            # Limpar espaços e linhas em branco excessivas
+            text = re.sub(r'[ \t]+', ' ', text)
+            text = re.sub(r'\n\s*\n', '\n\n', text)
+            text = text.strip()
+
+            # Filtrar linhas muito curtas (provavelmente navegação/menu)
+            lines = text.split('\n')
+            filtered_lines = []
+            for line in lines:
+                line = line.strip()
+                if len(line) > 15:  # Ignorar linhas muito curtas
+                    filtered_lines.append(line)
+
+            text = '\n'.join(filtered_lines)
+
+            # Limitar tamanho
+            if len(text) > max_chars:
+                # Tentar cortar em um ponto natural (fim de frase)
+                cut_point = text.rfind('.', max_chars - 200, max_chars)
+                if cut_point > max_chars // 2:
+                    text = text[:cut_point + 1]
+                else:
+                    text = text[:max_chars]
+
+            if len(text) > 50:
+                logger.info(f"WebSearch: extracted {len(text)} chars from {url}")
+                return text
+            else:
+                logger.warning(f"WebSearch: too little content from {url} ({len(text)} chars)")
+                return ""
+
+    except httpx.TimeoutException:
+        logger.warning(f"WebSearch: timeout fetching {url}")
+        return ""
+    except Exception as e:
+        logger.warning(f"WebSearch: error fetching {url}: {type(e).__name__}: {e}")
+        return ""
+
+
+def _is_trusted_site(url: str) -> bool:
+    """Verifica se a URL pertence a um site confiável."""
+    return any(site in url for site in TRUSTED_SITES)
+
+
+def _sort_results_by_trust(results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Ordena resultados priorizando sites confiáveis."""
+    trusted = [r for r in results if _is_trusted_site(r["url"])]
+    others = [r for r in results if not _is_trusted_site(r["url"])]
+    return trusted + others
+
+
+async def search_web_for_resolution(question_text: str) -> str:
+    """
+    v7: Pipeline completo de busca web para uma questão.
+    1. Gera keywords otimizadas
+    2. Busca no Google
+    3. Acessa 2-3 URLs (priorizando sites confiáveis)
+    4. Extrai conteúdo
+    5. Retorna conteúdo concatenado (máx 4000 chars)
+
+    Retorna string vazia se falhar ou não encontrar nada.
+    """
+    try:
+        # Timeout global para toda a operação de busca
+        return await asyncio.wait_for(
+            _search_web_for_resolution_inner(question_text),
+            timeout=WEB_SEARCH_TIMEOUT + 15  # 10s busca + 15s extra para extração
+        )
+    except asyncio.TimeoutError:
+        logger.warning("WebSearch: global timeout exceeded for web search pipeline")
+        return ""
+    except Exception as e:
+        logger.warning(f"WebSearch: pipeline error: {type(e).__name__}: {e}")
+        return ""
+
+
+async def _search_web_for_resolution_inner(question_text: str) -> str:
+    """Implementação interna do pipeline de busca."""
+
+    # 1. Gerar keywords
+    search_query = await generate_search_query(question_text)
+
+    # 2. Buscar no Google (duas queries para mais cobertura)
+    query_main = f"resolução {search_query}"
+    query_alt = f"{search_query} resolução passo a passo ENEM"
+
+    # Executar buscas em paralelo
+    results_main, results_alt = await asyncio.gather(
+        web_search(query_main, num_results=5),
+        web_search(query_alt, num_results=5),
+        return_exceptions=True,
+    )
+
+    # Tratar exceções
+    if isinstance(results_main, Exception):
+        logger.warning(f"WebSearch: main search failed: {results_main}")
+        results_main = []
+    if isinstance(results_alt, Exception):
+        logger.warning(f"WebSearch: alt search failed: {results_alt}")
+        results_alt = []
+
+    # Combinar e deduplicar resultados
+    all_results = []
+    seen_urls = set()
+    for r in list(results_main) + list(results_alt):
+        if r["url"] not in seen_urls:
+            seen_urls.add(r["url"])
+            all_results.append(r)
+
+    if not all_results:
+        logger.info("WebSearch: no results found")
+        return ""
+
+    # 3. Ordenar priorizando sites confiáveis
+    sorted_results = _sort_results_by_trust(all_results)
+
+    logger.info(f"WebSearch: {len(sorted_results)} unique results, extracting content from top 3...")
+
+    # 4. Extrair conteúdo das top 3 URLs (em paralelo)
+    urls_to_fetch = [r["url"] for r in sorted_results[:3]]
+    extraction_tasks = [extract_page_content(url) for url in urls_to_fetch]
+    contents = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+    # 5. Montar conteúdo final
+    web_content = ""
+    total_chars = 0
+    sources_used = 0
+
+    for i, content in enumerate(contents):
+        if isinstance(content, Exception) or not content:
+            continue
+
+        url = urls_to_fetch[i]
+        remaining = WEB_CONTENT_MAX_CHARS - total_chars
+        if remaining <= 100:
+            break
+
+        # Truncar conteúdo individual se necessário
+        if len(content) > remaining:
+            content = content[:remaining]
+
+        web_content += f"\n--- Fonte: {url} ---\n{content}\n"
+        total_chars += len(content)
+        sources_used += 1
+
+    if sources_used > 0:
+        logger.info(f"WebSearch: successfully extracted content from {sources_used} sources ({total_chars} chars total)")
+    else:
+        logger.info("WebSearch: no usable content extracted from any source")
+
+    return web_content
+
+
+# ============================================================================
+# FIM DO WEB SEARCH ENGINE v7
+# ============================================================================
 
 
 # =========================
@@ -1377,6 +1854,10 @@ class UserState:
     aluno_disse_errou: bool = False
     # v6: Flag de que o aluno pediu resolução direta
     aluno_pediu_direto: bool = False
+    # v7: Conteúdo web encontrado para a questão ativa
+    web_search_content: str = ""
+    # v7: Flag indicando que busca web já foi feita para esta questão
+    web_search_done: bool = False
 
 
 USER_STATES: Dict[int, UserState] = {}
@@ -1540,8 +2021,9 @@ def get_fallback_response(mode: str, user_name: Optional[str]) -> str:
     return random.choice(templates).replace("{name}", name)
 
 
+
 # =========================
-# SYSTEM PROMPT v6 — Com auto-verificação, thinking, anti-repetição, comportamento simplificado
+# SYSTEM PROMPT v7 — Com auto-verificação, thinking, anti-repetição, comportamento simplificado + WEB SEARCH
 # =========================
 SYSTEM_PROMPT_TEMPLATE = """Você é o Professor Vector, tutor de Matemática para ENEM (16-20 anos). Tutor estratégico, NÃO assistente genérico.
 
@@ -1552,7 +2034,7 @@ IDENTIDADE:
 
 IMPORTANTE: Antes de responder, raciocine internamente passo a passo. Verifique cada cálculo antes de apresentá-lo. Pense cuidadosamente sobre a interpretação correta do problema antes de começar a resolver.
 
-REGRAS DE CONDUÇÃO — v6 (OBRIGATÓRIAS):
+REGRAS DE CONDUÇÃO — v7 (OBRIGATÓRIAS):
 
 1. QUANDO RECEBER UMA QUESTÃO E O ALUNO NÃO PEDIU PARA RESOLVER JUNTO:
    → Resolver COMPLETA em 1-2 mensagens, mostrando TODOS os passos detalhados.
@@ -1628,6 +2110,14 @@ RIGOR MATEMÁTICO — REGRAS INVIOLÁVEIS:
 11. Ao resolver, SEMPRE mostre os cálculos intermediários. Nunca pule etapas.
 12. Use os EXEMPLOS DE RESOLUÇÃO abaixo como referência de estilo e nível de detalhe.
 
+v7 — USO DE RESOLUÇÕES WEB COMO REFERÊNCIA:
+- Se houver resoluções encontradas na web abaixo, use-as como REFERÊNCIA PRINCIPAL para validar sua abordagem.
+- COMPARE sua resolução com as resoluções web. Se divergirem, PRIORIZE a abordagem das resoluções web (elas foram verificadas por professores).
+- NÃO copie o texto da web literalmente. Reescreva no estilo do Professor Wisner.
+- NÃO mencione ao aluno que consultou a web. Apresente como sua própria resolução.
+- Se as resoluções web mostrarem um método diferente do seu, ADOTE o método da web.
+- Use as resoluções web para VERIFICAR seus cálculos antes de enviar.
+
 ESTILO DE RESOLUÇÃO (Professor Wisner):
 - Traduzir o cenário do enunciado para modelo matemático ANTES de calcular.
 - Passo a passo detalhado: escrever fórmula genérica, depois com valores substituídos.
@@ -1672,6 +2162,7 @@ def build_system_prompt(
     aluno_disse_errou: bool = False,
     aluno_pediu_direto: bool = False,
     question_message_count: int = 0,
+    web_search_content: str = "",  # v7: conteúdo web
 ) -> str:
     greeting = f"SEMPRE chame o aluno de {user_name}. NUNCA use outro nome." if user_name else ""
 
@@ -1728,6 +2219,15 @@ def build_system_prompt(
         if alternatives:
             prompt += f"\n\nALTERNATIVAS:\n{alternatives}"
 
+    # v7: Injetar conteúdo web como referência (ANTES dos exemplos do knowledge base)
+    if web_search_content:
+        prompt += (
+            "\n\n=== RESOLUÇÕES ENCONTRADAS NA WEB (use como REFERÊNCIA PRINCIPAL para validar sua resolução) ===\n"
+            "IMPORTANTE: Compare sua abordagem com estas resoluções. Se divergirem, PRIORIZE o método encontrado na web.\n"
+            "NÃO copie literalmente. Reescreva no estilo do Professor Wisner. NÃO mencione a web ao aluno.\n"
+        )
+        prompt += web_search_content
+
     # Injetar exemplos relevantes do knowledge_base
     question_text = active_question or ""
     relevant_examples = knowledge_base.get_relevant_examples(question_text, max_examples=6)
@@ -1739,7 +2239,7 @@ def build_system_prompt(
 
 
 # =========================
-# TELEGRAM HANDLERS
+# TELEGRAM HANDLERS v7
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1758,6 +2258,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.question_message_count = 0
     st.aluno_disse_errou = False
     st.aluno_pediu_direto = False
+    st.web_search_content = ""
+    st.web_search_done = False
     router._clear_sticky(uid)
     await update.message.reply_text(
         "Olá! Antes de começarmos, preciso do seu nome completo para personalizar nossa conversa. Pode me dizer?"
@@ -1780,6 +2282,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.question_message_count = 0
     st.aluno_disse_errou = False
     st.aluno_pediu_direto = False
+    st.web_search_content = ""
+    st.web_search_done = False
     router._clear_sticky(uid)
     if old_name:
         await update.message.reply_text(f"Certo, {old_name}.\n\nO que temos para hoje? Qual questão ou tópico você quer explorar?")
@@ -1875,7 +2379,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.chat.send_action("typing")
 
-    # === GESTÃO DE QUESTÃO ATIVA v6 ===
+    # === GESTÃO DE QUESTÃO ATIVA v7 ===
 
     # Detectar se aluno está se referindo a questão antiga
     if is_referring_old_question(user_text) and st.question_resolved:
@@ -1895,6 +2399,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.question_message_count = 0
         st.aluno_disse_errou = False
         st.aluno_pediu_direto = False
+        st.web_search_content = ""  # v7: limpar busca web
+        st.web_search_done = False
         if len(st.history) > 4:
             st.history = st.history[-4:]
         st.score_travado = max(0, st.score_travado - 2)
@@ -1902,8 +2408,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.score_frustrado = 0
         st.consecutive_errors = 0
 
-    # Detectar nova questão
-    if is_new_question(user_text) or has_image:
+    # === v7: Detectar nova questão e disparar busca web ===
+    is_new_q = is_new_question(user_text) or has_image
+    if is_new_q:
         if has_image:
             st.active_question = f"[Questão enviada por imagem] {user_text}"
             st.question_from_image = True
@@ -1918,6 +2425,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.question_message_count = 0
         st.aluno_disse_errou = False
         st.aluno_pediu_direto = False
+        st.web_search_content = ""  # v7: resetar busca web
+        st.web_search_done = False
         if len(st.history) > 4:
             st.history = st.history[-4:]
         st.score_travado = 0
@@ -1925,6 +2434,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.score_frustrado = 0
         st.score_autonomo = 0
         st.consecutive_errors = 0
+
+        # v7: BUSCA WEB ASSÍNCRONA para nova questão (apenas texto, não imagem)
+        # Para imagens, a busca será feita após o Gemini processar a imagem
+        if not has_image and user_text and not user_text.startswith("["):
+            try:
+                logger.info(f"WebSearch: initiating web search for new question (user {uid})")
+                web_content = await search_web_for_resolution(user_text)
+                if web_content:
+                    st.web_search_content = web_content
+                    st.web_search_done = True
+                    logger.info(f"WebSearch: content stored for user {uid} ({len(web_content)} chars)")
+                else:
+                    st.web_search_done = True
+                    logger.info(f"WebSearch: no content found for user {uid}")
+            except Exception as e:
+                logger.warning(f"WebSearch: failed for user {uid}: {e}")
+                st.web_search_done = True  # Marcar como feito mesmo em falha
 
     # Update mode
     if user_text and not user_text.startswith("["):
@@ -1944,7 +2470,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(telegram_safe(cached))
             return
 
-    # Build system prompt (com questão ativa + knowledge base + v6 flags)
+    # Build system prompt (com questão ativa + knowledge base + v6 flags + v7 web content)
     sys_prompt = build_system_prompt(
         mode=st.mode,
         user_name=st.user_name,
@@ -1955,6 +2481,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aluno_disse_errou=st.aluno_disse_errou,
         aluno_pediu_direto=st.aluno_pediu_direto,
         question_message_count=st.question_message_count,
+        web_search_content=st.web_search_content,  # v7: injetar conteúdo web
     )
 
     # Add to history
@@ -1968,7 +2495,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(st.history) > mx:
         st.history = st.history[-mx:]
 
-    # Route through AIRouter v6 (Gemini-first)
+    # Route through AIRouter v7 (Gemini-first)
     answer = await router.generate(
         user_id=uid,
         system_prompt=sys_prompt,
@@ -2016,13 +2543,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             answer = answer_retry
 
-    # v6: Se Gemini leu a imagem e retornou dados, atualizar active_question com o conteúdo extraído
+    # v7: Se Gemini leu a imagem e retornou dados, atualizar active_question E disparar busca web
     if has_image and answer and st.question_from_image:
         if len(answer) > 50:
             st.active_question = (
                 f"[Questão enviada por imagem - JÁ PROCESSADA]\n"
                 f"Resposta inicial do tutor sobre a imagem:\n{answer[:500]}"
             )
+            # v7: Busca web após processar imagem (usar o texto extraído como base)
+            if not st.web_search_done:
+                try:
+                    # Extrair texto da questão da resposta do Gemini para buscar
+                    image_question_text = answer[:500]
+                    logger.info(f"WebSearch: initiating web search for image question (user {uid})")
+                    web_content = await search_web_for_resolution(image_question_text)
+                    if web_content:
+                        st.web_search_content = web_content
+                        logger.info(f"WebSearch: image question content stored for user {uid} ({len(web_content)} chars)")
+                    st.web_search_done = True
+                except Exception as e:
+                    logger.warning(f"WebSearch: failed for image question (user {uid}): {e}")
+                    st.web_search_done = True
 
     # Save to history
     st.history.append({"role": "assistant", "content": answer})
@@ -2054,7 +2595,7 @@ tg_app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Documen
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info("=== Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking ===")
+    logger.info("=== Professor Vector Bot — v7 Web Search + Anti-Loop + Auto-Verificação + Thinking ===")
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
         return
@@ -2111,12 +2652,23 @@ async def process_safe(update: Update):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "v6", "providers": router.get_status(), "knowledge_base_examples": len(knowledge_base.examples)}
+    return {
+        "status": "ok",
+        "version": "v7",
+        "features": ["web_search", "anti_loop", "auto_verification", "thinking"],
+        "providers": router.get_status(),
+        "knowledge_base_examples": len(knowledge_base.examples),
+        "web_search_config": {
+            "timeout": WEB_SEARCH_TIMEOUT,
+            "max_content_chars": WEB_CONTENT_MAX_CHARS,
+            "trusted_sites_count": len(TRUSTED_SITES),
+        },
+    }
 
 
 @app.get("/")
 async def root():
-    return {"status": "Professor Vector Bot — v6 Anti-Loop + Auto-Verificação + Thinking"}
+    return {"status": "Professor Vector Bot — v7 Web Search + Anti-Loop + Auto-Verificação + Thinking"}
 
 
 async def keep_alive():
